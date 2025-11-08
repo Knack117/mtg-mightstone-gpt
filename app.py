@@ -9,7 +9,7 @@ import hishel
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-# Mightstone 0.12.x imports
+# Mightstone 0.12.x
 from mightstone.services.scryfall import Scryfall
 from mightstone.services.edhrec import EdhRecStatic
 
@@ -21,7 +21,12 @@ APP_VERSION = os.environ.get("RENDER_GIT_COMMIT", "dev")
 USER_AGENT = os.environ.get("HTTP_USER_AGENT", f"{APP_NAME}/{APP_VERSION} (+https://render.com)")
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "30"))
 
-CACHE_DIR = os.environ.get("MIGHTSTONE_CACHE_DIR", "/var/mightstone/cache")
+# accept either var name
+CACHE_DIR = (
+    os.environ.get("MIGHTSTONE_CACHE_DIR")
+    or os.environ.get("MIGHTSTONE_CACHE")
+    or "/var/mightstone/cache"
+)
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 SPELLBOOK_BASE = "https://backend.commanderspellbook.com/api/combos"
@@ -29,16 +34,14 @@ SPELLBOOK_BASE = "https://backend.commanderspellbook.com/api/combos"
 # -----------------------------------------------------------------------------
 # Cached HTTP transport (Hishel + httpx)
 # -----------------------------------------------------------------------------
-# Minimal, compatible setup (no default_ttl arg)
-storage = hishel.FileStorage(base_path=CACHE_DIR)
+# ✅ Use the ASYNC storage with AsyncCacheTransport
+storage = hishel.AsyncFileStorage(base_path=CACHE_DIR)
 
-# Keep the controller simple and widely compatible
 controller = hishel.Controller(
     cacheable_methods=["GET"],
     cacheable_status_codes=[200],
 )
 
-# Retries at the transport layer; we also do polite backoff for Spellbook
 base_transport = httpx.AsyncHTTPTransport(retries=2)
 cache_transport = hishel.AsyncCacheTransport(
     transport=base_transport,
@@ -200,7 +203,6 @@ async def commander_summary(name: str = Query(..., description="Commander name (
                 break
         edhrec_summary["average_deck_sample"] = list(dict.fromkeys(sample))
     except Exception:
-        # keep EDHREC fields empty on failure
         pass
 
     return {
