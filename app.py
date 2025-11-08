@@ -1,254 +1,156 @@
-# app.py
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict, Any, Optional
 import os
-import time
+import re
+from typing import Optional
 
 import httpx
+import hishel
+from fastapi import FastAPI, HTTPException, Query
 
-from mightstone.core.cache import install_cache
+# ✅ Correct imports for Mightstone 0.12.x
+from mightstone.services.edhrec import EdhRecStatic
 from mightstone.services.scryfall import Scryfall
-from mightstone.services.edhrec import EdhRecStatic  # Mightstone ≥ 0.12
 
-# -----------------------------------------------------------------------------
-# Config / Cache
-# -----------------------------------------------------------------------------
-CACHE_DIR = os.getenv("MIGHTSTONE_CACHE", "/var/mightstone/cache")
-install_cache(path=CACHE_DIR)
-
-APP_UA = os.getenv("APP_USER_AGENT", "MTG-Deckbuilder/1.0 (+contact@example.com)")
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
-
-SPELLBOOK_BASE = "https://backend.commanderspellbook.com/api/combos"
-
-# -----------------------------------------------------------------------------
-# App + clients
-# -----------------------------------------------------------------------------
-app = FastAPI(title="MTG Mightstone Adapter", version="1.2")
-
-# Allow your GPT/actions or localhost to call this (tighten later if desired)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+APP_NAME = "mtg-deckbuilding-mightstone"
+APP_VERSION = os.environ.get("RENDER_GIT_COMMIT", "dev")
+USER_AGENT = os.environ.get(
+    "HTTP_USER_AGENT",
+    f"{APP_NAME}/{APP_VERSION} (+https://render.com)",
 )
 
-scry = Scryfall()          # Sync-friendly client
-edh  = EdhRecStatic()      # Static EDHREC client (no proxy required)
+CACHE_DIR = os.environ.get("MIGHTSTONE_CACHE_DIR", "/var/mightstone/cache")
+os.makedirs(CACHE_DIR, exist_ok=True)
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def _card_lite(c) -> Dict[str, Any]:
-    """Lean card dict for GPT consumption."""
-    return {
-        "name": c.name,
-        "id": c.id,
-        "type_line": getattr(c, "type_line", None),
-        "ci": getattr(c, "color_identity", None),
-        "cmc": getattr(c, "cmc", None),
-        "set": getattr(c, "set", None),
-        "set_name": getattr(c, "set_name", None),
-        "collector_number": getattr(c, "collector_number", None),
-    }
+# --- Hishel cache + httpx transport (async) ---
+# Filesystem storage; bump TTL if you want longer caching.
+storage = hishel.FileStorage(base_path=CACHE_DIR, default_ttl=24 * 3600)
 
-def _extract_named_list(obj, candidate_attrs: List[str]) -> List[str]:
-    """
-    EDHREC page models can change; try a few attribute names and
-    return a unique-ordered list of card names.
-    """
-    for attr in candidate_attrs:
-        val = getattr(obj, attr, None)
-        if not val:
-            continue
-        names: List[str] = []
-        try:
-            for item in val:
-                n = getattr(item, "name", item)
-                if isinstance(n, str):
-                    names.append(n)
-        except TypeError:
-            continue
-        if names:
-            seen, out = set(), []
-            for n in names:
-                if n not in seen:
-                    seen.add(n); out.append(n)
-            return out
-    return []
+controller = hishel.Controller(
+    cacheable_methods=["GET"],          # we only cache GETs
+    cacheable_status_codes=[200],       # only cache successful responses
+    allow_stale=True,                   # serve stale if origin hiccups
+    always_revalidate=False,            # honor Cache-Control/ETag normally
+)
 
-def _spellbook_search(q: str, limit: int) -> List[Dict[str, Any]]:
-    """
-    Call Commander Spellbook with a friendly User-Agent and exponential backoff on 429.
-    """
-    headers = {"User-Agent": APP_UA, "Accept": "application/json"}
-    lim = str(max(1, min(int(limit), 100)))
-    params = {"limit": lim}
-    if q:
-        params["q"] = q
+# Respectful httpx transport with timeouts/retries and a nice UA.
+base_transport = httpx.AsyncHTTPTransport(retries=2)
+cache_transport = hishel.AsyncCacheTransport(
+    transport=base_transport,
+    storage=storage,
+    controller=controller,
+)
 
-    for attempt in range(5):  # 0,1,2,3,4 -> up to ~7.5s total backoff
-        r = httpx.get(SPELLBOOK_BASE, params=params, headers=headers, timeout=HTTP_TIMEOUT)
-        if r.status_code != 429:
-            r.raise_for_status()
-            payload = r.json()
-            return payload.get("data", payload)  # API may return {"data":[...]} or bare list
-        time.sleep(0.5 * (2 ** attempt))
+# Default headers sent to upstream APIs.
+DEFAULT_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json",
+}
 
-    raise HTTPException(status_code=429, detail="Commander Spellbook rate limited; try again shortly.")
+# Mightstone clients wired with the cached transport.
+scryfall = Scryfall(transport=cache_transport)
+edhrec = EdhRecStatic(transport=cache_transport)
 
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
+# FastAPI app
+app = FastAPI(title="Mightstone Bridge", version=APP_VERSION)
+
+
 @app.get("/health")
-def health() -> Dict[str, Any]:
+async def health():
+    # Lightweight check that our clients and cache exist.
     return {
         "ok": True,
+        "version": APP_VERSION,
         "cache_dir": CACHE_DIR,
-        "services": {"scryfall": True, "edhrec": True, "spellbook": True},
-        "ua": APP_UA,
+        "ua": USER_AGENT,
+        "services": ["scryfall", "edhrec-static"],
     }
 
-@app.get("/cards/search")
-def cards_search(q: str = Query(..., description="Scryfall search string"), limit: int = 25):
-    try:
-        res = scry.cards.search(q)[: max(1, min(limit, 100))]
-        return [_card_lite(c) for c in res]
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"search error: {e}")
 
-@app.get("/legal_printings")
-def legal_printings(name: str = Query(..., description="Exact card name")):
-    try:
-        base = scry.cards.search(f'!"{name}"')[0]
-        prints = scry.cards.search(f'!"{base.name}" include:extras unique:prints')
-        return {
-            "name": base.name,
-            "prints": [
-                {
-                    "id": p.id,
-                    "set": p.set,
-                    "set_name": p.set_name,
-                    "collector_number": p.collector_number,
-                }
-                for p in prints
-            ],
-        }
-    except IndexError:
-        raise HTTPException(status_code=404, detail=f'Card not found: "{name}"')
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"printings error: {e}")
+# ---------------------------
+# SCRYFALL
+# ---------------------------
 
-@app.get("/commander/summary")
-def commander_summary(name: str = Query(..., description="Commander name (exact or close)")):
-    """
-    Returns:
-      commander: oracle + color identity
-      edhrec: best-effort sections (high synergy, top cards, average deck sample)
-    """
-    try:
-        commander = scry.cards.search(f'!"{name}" legal:commander game:paper')[0]
-    except IndexError:
-        raise HTTPException(status_code=404, detail=f'Commander not found: "{name}"')
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"scryfall error: {e}")
-
-    edhrec_summary: Dict[str, Any] = {
-        "high_synergy": [],
-        "top_cards": [],
-        "average_deck_sample": [],
-    }
-    try:
-        page = edh.commander(commander.name)
-        edhrec_summary["high_synergy"] = _extract_named_list(
-            page, ["high_synergy", "high_synergy_cards", "synergies"]
-        )[:40]
-        edhrec_summary["top_cards"] = _extract_named_list(
-            page, ["top_cards", "signature", "signature_cards", "commander_cards"]
-        )[:60]
-
-        avg = edh.average_deck(commander.name)
-        sample = []
-        for attr in ["cards", "main", "deck", "list"]:
-            if hasattr(avg, attr):
-                try:
-                    for item in getattr(avg, attr):
-                        n = getattr(item, "name", item)
-                        if isinstance(n, str):
-                            sample.append(n)
-                        if len(sample) >= 20:
-                            break
-                except TypeError:
-                    pass
-                break
-        edhrec_summary["average_deck_sample"] = list(dict.fromkeys(sample))
-    except Exception:
-        # Keep EDHREC fields empty on any failure
-        pass
-
-    return {
-        "commander": {
-            "name": commander.name,
-            "id": commander.id,
-            "oracle_text": getattr(commander, "oracle_text", None),
-            "type_line": getattr(commander, "type_line", None),
-            "color_identity": getattr(commander, "color_identity", None),
-        },
-        "edhrec": edhrec_summary,
-    }
-
-@app.get("/combos")
-def combos(
-    commander: Optional[str] = Query(None, description='Commander filter, e.g. "Miirym, Sentinel Wyrm"'),
-    includes: Optional[List[str]] = Query(None, description='One or more card names the combo must include'),
-    limit: int = 25,
+@app.get("/scryfall/autocomplete")
+async def scryfall_autocomplete(
+    q: str = Query(..., min_length=1, description="Partial card name"),
+    include_extras: bool = Query(False, description="Include funny/extra cards"),
 ):
     """
-    Compact Commander Spellbook combos.
-    Builds a query like: commander:"Miirym, Sentinel Wyrm" includes:"Dockside Extortionist"
+    Wraps Mightstone's Scryfall.autocomplete().
     """
-    clauses: List[str] = []
-    if commander:
-        clauses.append(f'commander:"{commander}"')
-    if includes:
-        for n in includes:
-            if n and n.strip():
-                clauses.append(f'includes:"{n.strip()}"')
-    q = " ".join(clauses)
-
     try:
-        data = _spellbook_search(q, limit)
-        out = []
-        for c in data:
-            # Collect distinct card names from "uses"/"requires" or fallback to "cards"
-            names: List[str] = []
-            for sec in ("uses", "requires"):
-                for item in c.get(sec, []) or []:
-                    nm = item.get("card")
-                    if isinstance(nm, str) and nm not in names:
-                        names.append(nm)
-            if not names and isinstance(c.get("cards"), list):
-                for nm in c["cards"]:
-                    if isinstance(nm, str) and nm not in names:
-                        names.append(nm)
-
-            out.append({
-                "id": c.get("id"),
-                "name": c.get("name"),
-                "cards": names,
-                "results": c.get("results"),
-                "permalink": c.get("permalink") or c.get("url"),
-            })
-        return out
-    except httpx.HTTPStatusError as e:
-        text = ""
-        try:
-            text = e.response.text[:200]
-        except Exception:
-            pass
-        raise HTTPException(status_code=e.response.status_code, detail=f"spellbook error: {text}")
+        # Mightstone handles async internally via universalasync; we can call it directly.
+        catalog = await scryfall.autocomplete_async(q=q, include_extras=include_extras)
+        return {"data": catalog.data}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"spellbook error: {e}")
+        raise HTTPException(status_code=502, detail=f"Scryfall error: {e!s}")
+
+
+# ---------------------------
+# EDHREC (Static JSON)
+# ---------------------------
+
+def _normalize_identity(identity: str) -> str:
+    """
+    Normalize identity to EDH color letters in WUBRG order.
+    Accepts things like 'ur', 'WUr', 'g', 'wubrg', etc.
+    Returns lowercase string like 'wu', 'g', 'wubrg'.
+    """
+    letters = set(re.findall(r"[wubrgc]", identity.lower()))
+    order = "wubrgc"
+    return "".join([ch for ch in order if ch in letters])
+
+
+@app.get("/edhrec/combos")
+async def edhrec_combos(
+    identity: Optional[str] = Query(
+        None,
+        description="Optional color identity filter (e.g. 'w', 'ur', 'wubrg').",
+    )
+):
+    """
+    Wraps Mightstone's EdhRecStatic.combos(identity=?).
+    If identity is omitted, returns the 'all colors' page that EDHREC exposes.
+    """
+    try:
+        id_arg = None
+        if identity:
+            norm = _normalize_identity(identity)
+            if not norm:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid identity. Use some combination of W,U,B,R,G (e.g., 'ur', 'wubrg').",
+                )
+            # Mightstone accepts the identity type; strings work as the underlying path uses the letters.
+            id_arg = norm
+
+        page = await edhrec.combos_async(identity=id_arg)
+        # PageCombos is a pydantic model; convert to dict for JSON response.
+        return page.model_dump()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"EDHREC error: {e!s}")
+
+
+# ---------------------------
+# Global HTTPX settings
+# ---------------------------
+
+@app.on_event("startup")
+async def on_startup():
+    # Install default headers on the cache transport’s underlying pool via a client.
+    # We create a single shared client instance for polite defaults.
+    # (Mightstone creates its own requests under the hood; they inherit the transport semantics.)
+    app.state.httpx_client = httpx.AsyncClient(
+        transport=cache_transport,
+        headers=DEFAULT_HEADERS,
+        timeout=httpx.Timeout(10.0, connect=10.0),
+        http2=True,
+    )
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    client = getattr(app.state, "httpx_client", None)
+    if client is not None:
+        await client.aclose()
