@@ -302,7 +302,7 @@ async def on_startup():
         transport=cache_transport,
         headers=DEFAULT_HEADERS,
         timeout=httpx.Timeout(10.0, connect=10.0),
-        http2=True,
+        http2=False,  # <-- FIX: disable HTTP/2, avoids 'h2' dependency
     )
 
 @app.on_event("shutdown")
