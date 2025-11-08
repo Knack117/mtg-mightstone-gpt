@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: mtg-mightstone-api
+    env: docker
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /health
+    disk:
+      name: mightstone-cache
+      mountPath: /var/mightstone
+      sizeGB: 1
+    envVars:
+      - key: MIGHTSTONE_CACHE
+        value: /var/mightstone/cache
+
+  - type: cron
+    name: mightstone-warm-cache
+    schedule: "0 10 * * *"   # daily 10:00 UTC
+    env: docker
+    dockerCommand: |
+      python - <<'PY'
+      # lightweight cache warm: hit a few endpoints so Render image cache is hot
+      import requests, os
+      BASE = os.environ.get("SERVICE_URL", "https://mtg-mightstone-api.onrender.com")
+      for path in ["/health",
+                   "/cards/search?q=type%3Aartifact%20cmc%3C%3D2&limit=1",
+                   "/commander/summary?name=Miirym,%20Sentinel%20Wyrm"]:
+          try:
+              print(path, requests.get(BASE + path, timeout=30).status_code)
+          except Exception as e:
+              print("warm fail", path, e)
+      PY
+    envVars:
+      - key: SERVICE_URL
+        value: https://mtg-mightstone-api.onrender.com
