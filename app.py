@@ -5,7 +5,7 @@ import time
 import json
 import logging
 from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import hishel
@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-# Mightstone (EDHREC); Scryfall is called via REST
+# Mightstone (EDHREC)
 from mightstone.services.edhrec import EdhRecStatic, EdhRecProxiedStatic
 
 # -----------------------------------------------------------------------------
@@ -39,7 +39,7 @@ SPELLBOOK_BASE = "https://backend.commanderspellbook.com/api/combos"
 SCRYFALL_SEARCH_URL = "https://api.scryfall.com/cards/search"
 SCRYFALL_AUTOCOMPLETE_URL = "https://api.scryfall.com/cards/autocomplete"
 
-# Browser-like headers for EDHREC HTML fetching (to avoid simple bot challenges)
+# Browser-like headers for EDHREC HTML fetching
 BROWSER_HEADERS = {
     "User-Agent": os.environ.get(
         "BROWSER_UA",
@@ -53,10 +53,6 @@ BROWSER_HEADERS = {
     "Pragma": "no-cache",
     "DNT": "1",
     "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
 }
 
 # -----------------------------------------------------------------------------
@@ -81,7 +77,7 @@ DEFAULT_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 app = FastAPI(title="Mightstone Bridge", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten if desired
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -91,8 +87,6 @@ app.add_middleware(
 LOG_LEVEL = os.environ.get("MIGHTSTONE_LOG_LEVEL") or ("DEBUG" if os.environ.get("MIGHTSTONE_DEBUG") else "INFO")
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("mightstone-bridge")
-# logging.getLogger("httpx").setLevel(logging.DEBUG)
-# logging.getLogger("hishel").setLevel(logging.DEBUG)
 
 # -----------------------------------------------------------------------------
 # Clients
@@ -100,7 +94,7 @@ logger = logging.getLogger("mightstone-bridge")
 edh = EdhRecStatic(transport=cache_transport)
 
 # -----------------------------------------------------------------------------
-# Identity mapping (letters -> EDHREC faction segment)
+# Identity mapping (letters -> EDHREC segment)
 # -----------------------------------------------------------------------------
 def _normalize_identity(identity: str) -> str:
     letters = [ch for ch in identity.lower() if ch in "wubrgc"]
@@ -110,36 +104,17 @@ def _normalize_identity(identity: str) -> str:
             out.append(ch)
     return "".join(out)
 
-_ID_MONO = {
-    "w": "white",
-    "u": "blue",
-    "b": "black",
-    "r": "red",
-    "g": "green",
-    "c": "colorless",
-}
+_ID_MONO = {"w": "white", "u": "blue", "b": "black", "r": "red", "g": "green", "c": "colorless"}
 _ID_GUILDS = {
-    frozenset("wu"): "azorius",
-    frozenset("ub"): "dimir",
-    frozenset("br"): "rakdos",
-    frozenset("rg"): "gruul",
-    frozenset("gw"): "selesnya",
-    frozenset("wb"): "orzhov",
-    frozenset("ur"): "izzet",
-    frozenset("bg"): "golgari",
-    frozenset("rw"): "boros",
+    frozenset("wu"): "azorius", frozenset("ub"): "dimir",   frozenset("br"): "rakdos",
+    frozenset("rg"): "gruul",   frozenset("gw"): "selesnya",frozenset("wb"): "orzhov",
+    frozenset("ur"): "izzet",   frozenset("bg"): "golgari", frozenset("rw"): "boros",
     frozenset("gu"): "simic",
 }
 _ID_SHARDS_WEDGES = {
-    frozenset("wub"): "esper",
-    frozenset("ubr"): "grixis",
-    frozenset("brg"): "jund",
-    frozenset("wrg"): "naya",
-    frozenset("wug"): "bant",
-    frozenset("wur"): "jeskai",
-    frozenset("ubg"): "sultai",
-    frozenset("wbr"): "mardu",
-    frozenset("urg"): "temur",
+    frozenset("wub"): "esper",  frozenset("ubr"): "grixis", frozenset("brg"): "jund",
+    frozenset("wrg"): "naya",   frozenset("wug"): "bant",   frozenset("wur"): "jeskai",
+    frozenset("ubg"): "sultai", frozenset("wbr"): "mardu",  frozenset("urg"): "temur",
     frozenset("wbg"): "abzan",
 }
 
@@ -157,7 +132,7 @@ def _identity_to_edhrec_segment(identity: str) -> str:
     return ident or "colorless"
 
 # -----------------------------------------------------------------------------
-# Helpers (Scryfall + EDHREC + Spellbook)
+# Helpers (Scryfall + Spellbook)
 # -----------------------------------------------------------------------------
 def _card_lite_from_scryfall_card(c: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -173,27 +148,6 @@ def _card_lite_from_scryfall_card(c: Dict[str, Any]) -> Dict[str, Any]:
 
 def _normalize_theme_name(name: str) -> str:
     return re.sub(r"\s+", "-", name.strip().lower())
-
-def _extract_named_list_from_edhrec(obj: Any, candidate_attrs: List[str]) -> List[str]:
-    for attr in candidate_attrs:
-        val = getattr(obj, attr, None)
-        if not val:
-            continue
-        names: List[str] = []
-        try:
-            for item in val:
-                n = getattr(item, "name", item)
-                if isinstance(n, str):
-                    names.append(n)
-        except TypeError:
-            continue
-        if names:
-            seen, out = set(), []
-            for n in names:
-                if n not in seen:
-                    seen.add(n); out.append(n)
-            return out
-    return []
 
 async def _scryfall_search(q: str, limit: int) -> List[Dict[str, Any]]:
     client: httpx.AsyncClient = app.state.httpx_client
@@ -228,15 +182,13 @@ def _spellbook_search(q: str, limit: int) -> List[Dict[str, Any]]:
     params = {"limit": lim}
     if q:
         params["q"] = q
-
-    for attempt in range(5):  # exponential backoff on 429
+    for attempt in range(5):
         r = httpx.get(SPELLBOOK_BASE, params=params, headers=headers, timeout=HTTP_TIMEOUT)
         if r.status_code != 429:
             r.raise_for_status()
             payload = r.json()
             return payload.get("data", payload)
         time.sleep(0.5 * (2 ** attempt))
-
     raise HTTPException(status_code=429, detail="Commander Spellbook rate limited; try again shortly.")
 
 def _to_dict(obj) -> dict:
@@ -261,6 +213,9 @@ def _to_dict(obj) -> dict:
         logger.exception("Serialization failed: %s", e)
         return {}
 
+# -----------------------------------------------------------------------------
+# PageTheme normalizer
+# -----------------------------------------------------------------------------
 def _normalize_page_theme_payload(data: dict) -> dict:
     header = (data or {}).get("header") or "Unknown"
     description = (data or {}).get("description") or ""
@@ -291,14 +246,12 @@ def _normalize_page_theme_payload(data: dict) -> dict:
     return {"header": header, "description": description, "container": {"collections": norm_collections}}
 
 # -----------------------------------------------------------------------------
-# EDHREC Theme Extraction (Next.js JSON + HTML fallback)
+# EDHREC Theme Extraction (Next.js build JSON + inline + mirror + HTML)
 # -----------------------------------------------------------------------------
 def _collect_cards_from_next(obj: Any) -> List[Dict[str, Any]]:
-    """Walk arbitrary nested dict/list and yield items that look like cards."""
     out: List[Dict[str, Any]] = []
     def visit(x):
         if isinstance(x, dict):
-            # Heuristics for a card-like object
             name = x.get("name") or x.get("cardname") or x.get("card_name")
             if isinstance(name, str) and name.strip():
                 img = x.get("image") or x.get("image_normal") or x.get("image_url")
@@ -310,7 +263,6 @@ def _collect_cards_from_next(obj: Any) -> List[Dict[str, Any]]:
             for v in x:
                 visit(v)
     visit(obj)
-    # Dedup by name
     seen = set()
     dedup: List[Dict[str, Any]] = []
     for it in out:
@@ -321,10 +273,7 @@ def _collect_cards_from_next(obj: Any) -> List[Dict[str, Any]]:
     return dedup
 
 def _collections_from_next(page_props: dict) -> List[Dict[str, Any]]:
-    """Try to build logical sections from Next.js data."""
     cols: List[Dict[str, Any]] = []
-
-    # Common buckets we’ve seen on EDHREC
     buckets = [
         ("High Synergy", ["high_synergy", "highSynergy", "high_synergy_cards"]),
         ("Top Cards", ["top", "top_cards", "signature", "signature_cards"]),
@@ -338,7 +287,6 @@ def _collections_from_next(page_props: dict) -> List[Dict[str, Any]]:
         ("Planeswalkers", ["planeswalkers"]),
         ("Lands", ["lands"]),
     ]
-
     for header, keys in buckets:
         for k in keys:
             if k in page_props:
@@ -346,38 +294,53 @@ def _collections_from_next(page_props: dict) -> List[Dict[str, Any]]:
                 if items:
                     cols.append({"header": header, "items": items})
                     break
-
-    # If nothing matched, try scanning for generic sections-like arrays
     if not cols:
-        # Look for arrays of objects with "name" keys
         for key, val in page_props.items():
             if isinstance(val, list) and val and isinstance(val[0], dict) and "name" in val[0]:
                 items = _collect_cards_from_next(val)
                 if items:
                     cols.append({"header": key.replace("_", " ").title(), "items": items})
-
     return cols
 
-async def _fetch_next_data(client: httpx.AsyncClient, url: str, headers: dict) -> Optional[dict]:
-    """Fetch HTML, parse __NEXT_DATA__ JSON, return its props/pageProps dict if found."""
+async def _fetch_next_inline(client: httpx.AsyncClient, url: str, headers: dict) -> Tuple[Optional[str], Optional[dict], Optional[str]]:
+    """
+    Return (buildId, pageProps, titleFromInline) from inline __NEXT_DATA__ if present.
+    """
     r = await client.get(url, headers=headers, follow_redirects=True)
     if r.status_code != 200 or not r.text:
-        return None
+        return None, None, None
     soup = BeautifulSoup(r.text, "html.parser")
     script = soup.find("script", id="__NEXT_DATA__", type="application/json")
+    title_tag = soup.select_one("title")
+    title_inline = title_tag.get_text(strip=True) if title_tag else None
     if not script or not script.text:
-        return None
+        return None, None, title_inline
     try:
         data = json.loads(script.text)
-        # Next.js structure: { props: { pageProps: {...} } } OR { pageProps: {...} }
+        build_id = data.get("buildId")
         props = data.get("props") or {}
         page_props = props.get("pageProps") or data.get("pageProps") or {}
-        return page_props
+        return build_id, page_props, title_inline
+    except Exception:
+        return None, None, title_inline
+
+async def _fetch_next_page_json(client: httpx.AsyncClient, build_id: str, theme_slug: str, segment: str, headers: dict) -> Optional[dict]:
+    """
+    Fetches the concrete Next.js data file:
+    /_next/data/<buildId>/tags/<theme>/<segment>.json
+    Returns pageProps dict if available.
+    """
+    next_url = f"https://edhrec.com/_next/data/{build_id}/tags/{theme_slug}/{segment}.json"
+    r = await client.get(next_url, headers=headers, follow_redirects=True)
+    if r.status_code != 200:
+        return None
+    try:
+        data = r.json()
+        return (data.get("pageProps") or data.get("props", {}).get("pageProps")) or None
     except Exception:
         return None
 
 async def _fetch_json_mirror(client: httpx.AsyncClient, theme_slug: str, segment: str, headers: dict) -> Optional[dict]:
-    """Try the json.edhrec.com mirror: /tags/<theme>/<segment>.json"""
     json_url = f"https://json.edhrec.com/tags/{theme_slug}/{segment}.json"
     r = await client.get(json_url, headers=headers, follow_redirects=True)
     if r.status_code != 200:
@@ -388,61 +351,72 @@ async def _fetch_json_mirror(client: httpx.AsyncClient, theme_slug: str, segment
         return None
 
 async def _parse_edhrec_theme(theme_slug: str, identity: str) -> dict:
-    """Best-effort extraction via Next.js JSON first, then HTML heuristics."""
     segment = _identity_to_edhrec_segment(identity)
-    url = f"https://edhrec.com/tags/{theme_slug}/{segment}"
+    page_url = f"https://edhrec.com/tags/{theme_slug}/{segment}"
     client: httpx.AsyncClient = app.state.httpx_client
 
     headers = dict(BROWSER_HEADERS)
     headers["Referer"] = f"https://edhrec.com/tags/{segment}"
 
-    # 1) Next.js inlined data
-    page_props = await _fetch_next_data(client, url, headers=headers)
     header = ""
     description = ""
     collections: List[Dict[str, Any]] = []
 
-    if page_props:
-        # Header/description from props if present
-        for key in ("title", "header", "pageTitle"):
-            if isinstance(page_props.get(key), str) and page_props[key].strip():
-                header = page_props[key].strip()
-                break
-
+    # 1) Inline __NEXT_DATA__ (get buildId + pageProps)
+    build_id, inline_props, title_inline = await _fetch_next_inline(client, page_url, headers=headers)
+    if title_inline and not header:
+        header = title_inline
+    if inline_props:
         for key in ("description", "pageDescription"):
-            if isinstance(page_props.get(key), str):
-                description = page_props[key].strip() or description
+            if isinstance(inline_props.get(key), str) and inline_props[key].strip():
+                description = inline_props[key].strip()
+                break
+        collections = _collections_from_next(inline_props)
 
-        # Build collections from known buckets; if empty, scan generically
-        collections = _collections_from_next(page_props)
+    # 2) If we have buildId, pull the dedicated page JSON
+    if build_id:
+        next_props = await _fetch_next_page_json(client, build_id, theme_slug, segment, headers=headers)
+        if next_props:
+            if not header:
+                for key in ("title", "header", "pageTitle"):
+                    if isinstance(next_props.get(key), str) and next_props[key].strip():
+                        header = next_props[key].strip()
+                        break
+            if not description:
+                for key in ("description", "pageDescription"):
+                    if isinstance(next_props.get(key), str) and next_props[key].strip():
+                        description = next_props[key].strip()
+                        break
+            if not collections:
+                collections = _collections_from_next(next_props)
 
-    # 2) If still empty, try the JSON mirror
+    # 3) If still empty, try the json.edhrec.com mirror
     if not collections:
         mirror = await _fetch_json_mirror(client, theme_slug, segment, headers=headers)
         if mirror:
-            # Mirror might wrap useful data under known keys; try pageProps then root
-            mirror_props = mirror.get("pageProps") if isinstance(mirror, dict) else None
-            source = mirror_props or mirror
-            collections = _collections_from_next(source)
-            if not header:
-                header = (source.get("title") or source.get("header") or f"{segment.title()} {theme_slug.replace('-', ' ').title()}") if isinstance(source, dict) else ""
-            if not description and isinstance(source, dict):
-                description = source.get("description") or ""
+            source = mirror.get("pageProps") if isinstance(mirror, dict) else None
+            src = source or mirror
+            if not header and isinstance(src, dict):
+                for key in ("title", "header", "pageTitle"):
+                    if isinstance(src.get(key), str) and src[key].strip():
+                        header = src[key].strip()
+                        break
+            if not description and isinstance(src, dict):
+                for key in ("description", "pageDescription"):
+                    if isinstance(src.get(key), str) and src[key].strip():
+                        description = src[key].strip()
+                        break
+            collections = _collections_from_next(src)
 
-    # 3) If still empty, scrape minimal HTML (title/meta desc)
-    if not header or not description:
-        r = await client.get(url, headers=headers, follow_redirects=True)
+    # 4) Minimal HTML meta fallback (title/description) — already have header via <title> usually
+    if not description:
+        r = await client.get(page_url, headers=headers, follow_redirects=True)
         soup = BeautifulSoup(r.text or "", "html.parser")
-        if not header:
-            t = soup.select_one("title")
-            if t and t.get_text(strip=True):
-                header = t.get_text(strip=True)
-        if not description:
-            md = soup.select_one('meta[name="description"]')
-            if md and md.get("content"):
-                description = md["content"].strip()
+        md = soup.select_one('meta[name="description"]')
+        if md and md.get("content"):
+            description = md["content"].strip()
 
-    # Dedup items in each collection
+    # Dedup items
     for col in collections:
         seen = set()
         dedup: List[Dict[str, Any]] = []
@@ -454,7 +428,7 @@ async def _parse_edhrec_theme(theme_slug: str, identity: str) -> dict:
         col["items"] = dedup
 
     logger.debug("[EDHREC THEME] url=%s header=%s desc_len=%d sections=%d",
-                 url, header, len(description or ""), len(collections))
+                 page_url, header, len(description or ""), len(collections))
     return {"header": header or "Unknown", "description": description or "", "container": {"collections": collections}}
 
 # -----------------------------------------------------------------------------
@@ -462,25 +436,18 @@ async def _parse_edhrec_theme(theme_slug: str, identity: str) -> dict:
 # -----------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {
-        "ok": True,
-        "version": APP_VERSION,
-        "cache_dir": CACHE_DIR,
-        "ua": USER_AGENT,
-        "services": {"scryfall": True, "edhrec": True, "spellbook": True},
-    }
+    return {"ok": True, "version": APP_VERSION, "cache_dir": CACHE_DIR, "ua": USER_AGENT,
+            "services": {"scryfall": True, "edhrec": True, "spellbook": True}}
 
-# ---- Scryfall (REST) --------------------------------------------------------
+# ---- Scryfall ---------------------------------------------------------------
 @app.get("/cards/search")
 async def cards_search(q: str = Query(..., description="Scryfall search string"), limit: int = 25):
     try:
         return await _scryfall_search(q, limit)
     except httpx.HTTPStatusError as e:
         text = ""
-        try:
-            text = e.response.text[:200]
-        except Exception:
-            pass
+        try: text = e.response.text[:200]
+        except Exception: pass
         raise HTTPException(status_code=e.response.status_code, detail=f"scryfall error: {text}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"search error: {e}")
@@ -495,10 +462,8 @@ async def scryfall_autocomplete(
         return {"data": names}
     except httpx.HTTPStatusError as e:
         text = ""
-        try:
-            text = e.response.text[:200]
-        except Exception:
-            pass
+        try: text = e.response.text[:200]
+        except Exception: pass
         raise HTTPException(status_code=e.response.status_code, detail=f"Scryfall error: {text}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Scryfall error: {e!s}")
@@ -509,40 +474,25 @@ async def legal_printings(name: str = Query(..., description="Exact card name"))
         base = await _scryfall_first(f'!"{name}"')
         if not base:
             raise HTTPException(status_code=404, detail=f'Card not found: "{name}"')
-
         client: httpx.AsyncClient = app.state.httpx_client
-        r = await client.get(
-            SCRYFALL_SEARCH_URL,
-            params={"q": f'!"{base["name"]}" include:extras unique:prints'},
-        )
+        r = await client.get(SCRYFALL_SEARCH_URL, params={"q": f'!"{base["name"]}" include:extras unique:prints'})
         r.raise_for_status()
         prints_payload = r.json().get("data", [])
-
-        return {
-            "name": base["name"],
-            "prints": [
-                {
-                    "id": p.get("id"),
-                    "set": p.get("set"),
-                    "set_name": p.get("set_name"),
-                    "collector_number": p.get("collector_number"),
-                }
-                for p in prints_payload
-            ],
-        }
+        return {"name": base["name"], "prints": [
+            {"id": p.get("id"), "set": p.get("set"), "set_name": p.get("set_name"), "collector_number": p.get("collector_number")}
+            for p in prints_payload
+        ]}
     except HTTPException:
         raise
     except httpx.HTTPStatusError as e:
         text = ""
-        try:
-            text = e.response.text[:200]
-        except Exception:
-            pass
+        try: text = e.response.text[:200]
+        except Exception: pass
         raise HTTPException(status_code=e.response.status_code, detail=f"scryfall error: {text}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"printings error: {e}")
 
-# ---- Commander summary (Scryfall REST + EDHREC) -----------------------------
+# ---- Commander summary (Scryfall + EDHREC) ----------------------------------
 @app.get("/commander/summary")
 async def commander_summary(name: str = Query(..., description="Commander name (exact or close)")):
     try:
@@ -557,24 +507,36 @@ async def commander_summary(name: str = Query(..., description="Commander name (
     edhrec_summary: Dict[str, Any] = {"high_synergy": [], "top_cards": [], "average_deck_sample": []}
     try:
         page = await edh.commander_async(commander_card["name"])
-        edhrec_summary["high_synergy"] = _extract_named_list_from_edhrec(
-            page, ["high_synergy", "high_synergy_cards", "synergies"]
-        )[:40]
-        edhrec_summary["top_cards"] = _extract_named_list_from_edhrec(
-            page, ["top_cards", "signature", "signature_cards", "commander_cards"]
-        )[:60]
-
+        def _extract_named_list_from_edhrec(obj: Any, candidate_attrs: List[str]) -> List[str]:
+            for attr in candidate_attrs:
+                val = getattr(obj, attr, None)
+                if not val: continue
+                names: List[str] = []
+                try:
+                    for item in val:
+                        n = getattr(item, "name", item)
+                        if isinstance(n, str): names.append(n)
+                except TypeError:
+                    continue
+                if names:
+                    seen, out = set(), []
+                    for n in names:
+                        if n not in seen:
+                            seen.add(n); out.append(n)
+                    return out
+            return []
+        edhrec_summary["high_synergy"] = _extract_named_list_from_edhrec(page, ["high_synergy","high_synergy_cards","synergies"])[:40]
+        edhrec_summary["top_cards"]    = _extract_named_list_from_edhrec(page, ["top_cards","signature","signature_cards","commander_cards"])[:60]
         avg = await edh.average_deck_async(commander_card["name"])
         sample: List[str] = []
-        for attr in ["cards", "main", "deck", "list"]:
+        for attr in ["cards","main","deck","list"]:
             if hasattr(avg, attr):
                 try:
                     for item in getattr(avg, attr):
                         n = getattr(item, "name", item)
                         if isinstance(n, str):
                             sample.append(n)
-                        if len(sample) >= 20:
-                            break
+                        if len(sample) >= 20: break
                 except TypeError:
                     pass
                 break
@@ -593,7 +555,7 @@ async def commander_summary(name: str = Query(..., description="Commander name (
         "edhrec": edhrec_summary,
     }
 
-# ---- Commander Spellbook (REST) ---------------------------------------------
+# ---- Commander Spellbook ----------------------------------------------------
 @app.get("/combos")
 async def combos(
     commander: Optional[str] = Query(None, description='Commander filter, e.g. "Miirym, Sentinel Wyrm"'),
@@ -608,7 +570,6 @@ async def combos(
             if n and n.strip():
                 clauses.append(f'includes:"{n.strip()}"')
     q = " ".join(clauses)
-
     try:
         data = _spellbook_search(q, limit)
         out = []
@@ -623,7 +584,6 @@ async def combos(
                 for nm in c["cards"]:
                     if isinstance(nm, str) and nm not in names:
                         names.append(nm)
-
             out.append({
                 "id": c.get("id"),
                 "name": c.get("name"),
@@ -634,19 +594,15 @@ async def combos(
         return out
     except httpx.HTTPStatusError as e:
         txt = ""
-        try:
-            txt = e.response.text[:200]
-        except Exception:
-            pass
+        try: txt = e.response.text[:200]
+        except Exception: pass
         raise HTTPException(status_code=e.response.status_code, detail=f"spellbook error: {txt}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"spellbook error: {e}")
 
-# ---- EDHREC combos index (Mightstone) ---------------------------------------
+# ---- EDHREC combos index ----------------------------------------------------
 @app.get("/edhrec/combos")
-async def edhrec_combos(
-    identity: Optional[str] = Query(None, description="Optional color identity (e.g. 'w', 'ur', 'wubrg')."),
-):
+async def edhrec_combos(identity: Optional[str] = Query(None, description="Optional color identity (e.g. 'w', 'ur', 'wubrg').")):
     try:
         id_arg = None
         if identity:
@@ -661,7 +617,7 @@ async def edhrec_combos(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"EDHREC error: {e!s}")
 
-# ---- EDHREC theme (Next.js + mirror + minimal HTML) -------------------------
+# ---- EDHREC theme -----------------------------------------------------------
 @app.get("/edhrec/theme")
 async def edhrec_theme(
     name: str = Query(..., description="Theme/Tag slug or name, e.g. 'prowess'"),
@@ -672,7 +628,7 @@ async def edhrec_theme(
     if not norm_id:
         raise HTTPException(status_code=400, detail="Invalid identity; use W/U/B/R/G letters (e.g., 'wur').")
 
-    # Try Static Mightstone -> Proxied Mightstone
+    # Try Mightstone clients first
     try:
         page = await edh.theme_async(name=theme_name, identity=norm_id)
         raw = _to_dict(page)
@@ -681,7 +637,6 @@ async def edhrec_theme(
             return shaped
     except Exception as e:
         logger.info("Static theme fetch failed: %s", e)
-
     try:
         edh_proxy = EdhRecProxiedStatic(transport=cache_transport)
         page = await edh_proxy.theme_async(name=theme_name, identity=norm_id)
@@ -692,7 +647,7 @@ async def edhrec_theme(
     except Exception as e2:
         logger.info("Proxied theme fetch failed: %s", e2)
 
-    # HTML/JSON Next.js pipeline
+    # Next.js pipeline
     try:
         shaped = await _parse_edhrec_theme(theme_name, norm_id)
         return shaped
@@ -700,21 +655,7 @@ async def edhrec_theme(
         logger.exception("Theme parse failed: %s", e3)
         return {"header": "Unknown", "description": "", "container": {"collections": []}}
 
-# ---- EDHREC theme RAW (debug) -----------------------------------------------
-@app.get("/edhrec/theme_raw")
-async def edhrec_theme_raw(name: str, identity: str):
-    theme_name = _normalize_theme_name(name)
-    norm_id = _normalize_identity(identity)
-    try:
-        page = await edh.theme_async(name=theme_name, identity=norm_id)
-        raw = _to_dict(page)
-        return {"source": "static", "raw": raw}
-    except Exception:
-        edh_proxy = EdhRecProxiedStatic(transport=cache_transport)
-        page = await edh_proxy.theme_async(name=theme_name, identity=norm_id)
-        return {"source": "proxied", "raw": _to_dict(page)}
-
-# ---- EDHREC theme HTML preview (fetch debug via /tags) ----------------------
+# ---- Debug helpers ----------------------------------------------------------
 @app.get("/edhrec/theme_debug")
 async def edhrec_theme_debug(name: str, identity: str, preview: int = 1000):
     theme = _normalize_theme_name(name)
@@ -725,14 +666,27 @@ async def edhrec_theme_debug(name: str, identity: str, preview: int = 1000):
     headers["Referer"] = f"https://edhrec.com/tags/{segment}"
     r = await client.get(url, headers=headers, follow_redirects=True)
     text = r.text or ""
-    return {
-        "status": r.status_code,
-        "url": str(r.url),
-        "preview": text[: max(0, min(preview, 4000))],
-    }
+    return {"status": r.status_code, "url": str(r.url), "preview": text[: max(0, min(preview, 4000))]}
+
+@app.get("/edhrec/theme_nextdebug")
+async def edhrec_theme_nextdebug(name: str, identity: str):
+    theme = _normalize_theme_name(name)
+    segment = _identity_to_edhrec_segment(identity)
+    url = f"https://edhrec.com/tags/{theme}/{segment}"
+    client: httpx.AsyncClient = app.state.httpx_client
+    headers = dict(BROWSER_HEADERS)
+    headers["Referer"] = f"https://edhrec.com/tags/{segment}"
+    build_id, inline_props, title_inline = await _fetch_next_inline(client, url, headers=headers)
+    info = {"buildId": build_id, "hasInlineProps": bool(inline_props), "titleInline": title_inline}
+    if build_id:
+        next_props = await _fetch_next_page_json(client, build_id, theme, segment, headers=headers)
+        info["hasNextJson"] = bool(next_props)
+        if next_props:
+            info["nextKeys"] = list(next_props.keys())[:30]
+    return info
 
 # -----------------------------------------------------------------------------
-# Lifecycle: shared httpx client
+# Lifecycle
 # -----------------------------------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
