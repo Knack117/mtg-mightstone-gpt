@@ -160,6 +160,50 @@ def _spellbook_search(q: str, limit: int) -> List[Dict[str, Any]]:
 
     raise HTTPException(status_code=429, detail="Commander Spellbook rate limited; try again shortly.")
 
+def _coerce_page_theme_json(page: Any) -> Dict[str, Any]:
+    """
+    Normalize a Mightstone PageTheme-like object into:
+    {
+      "header": str,
+      "description": str,
+      "container": {
+        "collections": [
+          {"header": str, "items": [{"name": str, "id": str|null, "image": str|null}]}
+        ]
+      }
+    }
+    Always returns required keys to satisfy strict validators.
+    """
+    header = getattr(page, "header", "") or ""
+    description = getattr(page, "description", "") or ""
+    container_obj = getattr(page, "container", None)
+
+    collections = []
+    if container_obj is not None:
+        raw_sections = getattr(container_obj, "collections", None) or getattr(container_obj, "sections", None) or []
+        for sec in raw_sections or []:
+            sec_header = getattr(sec, "header", None) or getattr(sec, "title", "") or ""
+            cardviews = getattr(sec, "cardviews", None) or getattr(sec, "cards", None) or []
+            items = []
+            for cv in cardviews:
+                # support both pydantic objects and dicts
+                if isinstance(cv, dict):
+                    nm = cv.get("name") or cv.get("card_name") or ""
+                    cid = cv.get("id") or cv.get("scryfall_id")
+                    img = cv.get("image_normal") or cv.get("image") or None
+                else:
+                    nm = getattr(cv, "name", None) or getattr(cv, "card_name", "") or ""
+                    cid = getattr(cv, "id", None) or getattr(cv, "scryfall_id", None)
+                    img = getattr(cv, "image_normal", None) or getattr(cv, "image", None)
+                items.append({"name": nm, "id": cid, "image": img})
+            collections.append({"header": sec_header, "items": items})
+
+    return {
+        "header": header,
+        "description": description,
+        "container": {"collections": collections},
+    }
+
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
@@ -377,7 +421,8 @@ async def edhrec_theme(
     identity: str = Query(..., description="Color identity letters, e.g. 'wur' for Jeskai"),
 ):
     """
-    Fetch a Theme page (e.g., 'prowess' + 'wur') as structured JSON.
+    Fetch a Theme page (e.g., 'prowess' + 'wur') as a normalized JSON with:
+    { header, description, container: { collections: [...] } }
     Tries the fast static client first; falls back to the proxied client.
     """
     theme_name = _normalize_theme_name(name)
@@ -388,13 +433,13 @@ async def edhrec_theme(
     # Try static (fast)
     try:
         page = await edh.theme_async(name=theme_name, identity=norm_id)
-        return page.model_dump()
+        return _coerce_page_theme_json(page)
     except Exception:
         # Fallback to proxied (slower but more complete)
         try:
             edh_proxy = EdhRecProxiedStatic(transport=cache_transport)
             page = await edh_proxy.theme_async(name=theme_name, identity=norm_id)
-            return page.model_dump()
+            return _coerce_page_theme_json(page)
         except Exception as e2:
             raise HTTPException(status_code=502, detail=f"EDHREC theme error: {e2!s}")
 
