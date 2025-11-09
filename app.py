@@ -9,8 +9,7 @@ import hishel
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-# Mightstone 0.12.x
-from mightstone.services.scryfall import Scryfall
+# Mightstone (only used for EDHREC here; Scryfall is via REST)
 from mightstone.services.edhrec import EdhRecStatic
 
 # -----------------------------------------------------------------------------
@@ -21,7 +20,6 @@ APP_VERSION = os.environ.get("RENDER_GIT_COMMIT", "dev")
 USER_AGENT = os.environ.get("HTTP_USER_AGENT", f"{APP_NAME}/{APP_VERSION} (+https://render.com)")
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "30"))
 
-# accept either var name
 CACHE_DIR = (
     os.environ.get("MIGHTSTONE_CACHE_DIR")
     or os.environ.get("MIGHTSTONE_CACHE")
@@ -29,39 +27,37 @@ CACHE_DIR = (
 )
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# Upstreams
 SPELLBOOK_BASE = "https://backend.commanderspellbook.com/api/combos"
+SCRYFALL_SEARCH_URL = "https://api.scryfall.com/cards/search"
+SCRYFALL_AUTOCOMPLETE_URL = "https://api.scryfall.com/cards/autocomplete"
 
 # -----------------------------------------------------------------------------
 # Cached HTTP transport (Hishel + httpx)
 # -----------------------------------------------------------------------------
-# ✅ Use the ASYNC storage with AsyncCacheTransport
 storage = hishel.AsyncFileStorage(base_path=CACHE_DIR)
-
 controller = hishel.Controller(
     cacheable_methods=["GET"],
     cacheable_status_codes=[200],
 )
-
 base_transport = httpx.AsyncHTTPTransport(retries=2)
 cache_transport = hishel.AsyncCacheTransport(
     transport=base_transport,
     storage=storage,
     controller=controller,
 )
-
 DEFAULT_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 
 # -----------------------------------------------------------------------------
 # Clients
 # -----------------------------------------------------------------------------
-scry = Scryfall(transport=cache_transport)
+# EDHREC through Mightstone (uses our cached transport)
 edh = EdhRecStatic(transport=cache_transport)
 
 # -----------------------------------------------------------------------------
 # FastAPI app
 # -----------------------------------------------------------------------------
 app = FastAPI(title="Mightstone Bridge", version=APP_VERSION)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],   # tighten if desired
@@ -71,21 +67,61 @@ app.add_middleware(
 )
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Helpers (Scryfall + Spellbook)
 # -----------------------------------------------------------------------------
-def _card_lite(c) -> Dict[str, Any]:
+def _card_lite_from_scryfall_card(c: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "name": c.name,
-        "id": c.id,
-        "type_line": getattr(c, "type_line", None),
-        "ci": getattr(c, "color_identity", None),
-        "cmc": getattr(c, "cmc", None),
-        "set": getattr(c, "set", None),
-        "set_name": getattr(c, "set_name", None),
-        "collector_number": getattr(c, "collector_number", None),
+        "name": c.get("name"),
+        "id": c.get("id"),
+        "type_line": c.get("type_line"),
+        "ci": c.get("color_identity"),
+        "cmc": c.get("cmc"),
+        "set": c.get("set"),
+        "set_name": c.get("set_name"),
+        "collector_number": c.get("collector_number"),
     }
 
-def _extract_named_list(obj, candidate_attrs: List[str]) -> List[str]:
+async def _scryfall_search(q: str, limit: int) -> List[Dict[str, Any]]:
+    async with httpx.AsyncClient(
+        transport=cache_transport,
+        headers=DEFAULT_HEADERS,
+        timeout=httpx.Timeout(15.0, connect=10.0),
+    ) as client:
+        r = await client.get(SCRYFALL_SEARCH_URL, params={"q": q})
+        r.raise_for_status()
+        payload = r.json()
+        cards = payload.get("data", [])
+        return [_card_lite_from_scryfall_card(c) for c in cards[: max(1, min(limit, 100))]]
+
+async def _scryfall_autocomplete(q: str, include_extras: bool) -> List[str]:
+    params = {"q": q}
+    if include_extras:
+        params["include_extras"] = "true"
+    async with httpx.AsyncClient(
+        transport=cache_transport,
+        headers=DEFAULT_HEADERS,
+        timeout=httpx.Timeout(10.0, connect=10.0),
+    ) as client:
+        r = await client.get(SCRYFALL_AUTOCOMPLETE_URL, params=params)
+        r.raise_for_status()
+        payload = r.json()
+        return payload.get("data", [])
+
+async def _scryfall_first(q: str) -> Optional[Dict[str, Any]]:
+    """Return the first Scryfall card object for a query, or None."""
+    async with httpx.AsyncClient(
+        transport=cache_transport,
+        headers=DEFAULT_HEADERS,
+        timeout=httpx.Timeout(15.0, connect=10.0),
+    ) as client:
+        r = await client.get(SCRYFALL_SEARCH_URL, params={"q": q})
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        data = r.json().get("data", [])
+        return data[0] if data else None
+
+def _extract_named_list_from_edhrec(obj: Any, candidate_attrs: List[str]) -> List[str]:
     for attr in candidate_attrs:
         val = getattr(obj, attr, None)
         if not val:
@@ -106,6 +142,12 @@ def _extract_named_list(obj, candidate_attrs: List[str]) -> List[str]:
             return out
     return []
 
+def _normalize_identity(identity: str) -> str:
+    """Return letters in WUBRG(C) order, lowercase, from inputs like 'WUr', 'g', 'wubrg'."""
+    letters = set(re.findall(r"[wubrgc]", identity.lower()))
+    order = "wubrgc"
+    return "".join(ch for ch in order if ch in letters)
+
 def _spellbook_search(q: str, limit: int) -> List[Dict[str, Any]]:
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     lim = str(max(1, min(int(limit), 100)))
@@ -123,12 +165,6 @@ def _spellbook_search(q: str, limit: int) -> List[Dict[str, Any]]:
 
     raise HTTPException(status_code=429, detail="Commander Spellbook rate limited; try again shortly.")
 
-def _normalize_identity(identity: str) -> str:
-    """Return letters in WUBRG(C) order, lowercase, from inputs like 'WUr', 'g', 'wubrg'."""
-    letters = set(re.findall(r"[wubrgc]", identity.lower()))
-    order = "wubrgc"
-    return "".join(ch for ch in order if ch in letters)
-
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
@@ -142,52 +178,108 @@ async def health():
         "services": {"scryfall": True, "edhrec": True, "spellbook": True},
     }
 
+# ---- Scryfall (REST) --------------------------------------------------------
 @app.get("/cards/search")
 async def cards_search(q: str = Query(..., description="Scryfall search string"), limit: int = 25):
     try:
-        res = await scry.cards.search_async(q)
-        res = res[: max(1, min(limit, 100))]
-        return [_card_lite(c) for c in res]
+        return await _scryfall_search(q, limit)
+    except httpx.HTTPStatusError as e:
+        text = ""
+        try:
+            text = e.response.text[:200]
+        except Exception:
+            pass
+        raise HTTPException(status_code=e.response.status_code, detail=f"scryfall error: {text}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"search error: {e}")
+
+@app.get("/scryfall/autocomplete")
+async def scryfall_autocomplete(
+    q: str = Query(..., min_length=1, description="Partial card name"),
+    include_extras: bool = Query(False, description="Include funny/extra cards"),
+):
+    try:
+        names = await _scryfall_autocomplete(q, include_extras=include_extras)
+        return {"data": names}
+    except httpx.HTTPStatusError as e:
+        text = ""
+        try:
+            text = e.response.text[:200]
+        except Exception:
+            pass
+        raise HTTPException(status_code=e.response.status_code, detail=f"Scryfall error: {text}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Scryfall error: {e!s}")
 
 @app.get("/legal_printings")
 async def legal_printings(name: str = Query(..., description="Exact card name")):
     try:
-        base = (await scry.cards.search_async(f'!"{name}"'))[0]
-        prints = await scry.cards.search_async(f'!"{base.name}" include:extras unique:prints')
+        base = await _scryfall_first(f'!"{name}"')
+        if not base:
+            raise HTTPException(status_code=404, detail=f'Card not found: "{name}"')
+
+        # Use the resolved Scryfall name to fetch unique prints (includes extras)
+        async with httpx.AsyncClient(
+            transport=cache_transport,
+            headers=DEFAULT_HEADERS,
+            timeout=httpx.Timeout(15.0, connect=10.0),
+        ) as client:
+            r = await client.get(SCRYFALL_SEARCH_URL, params={"q": f'!"{base["name"]}" include:extras unique:prints'})
+            r.raise_for_status()
+            prints_payload = r.json().get("data", [])
+
         return {
-            "name": base.name,
+            "name": base["name"],
             "prints": [
-                {"id": p.id, "set": p.set, "set_name": p.set_name, "collector_number": p.collector_number}
-                for p in prints
+                {
+                    "id": p.get("id"),
+                    "set": p.get("set"),
+                    "set_name": p.get("set_name"),
+                    "collector_number": p.get("collector_number"),
+                }
+                for p in prints_payload
             ],
         }
-    except IndexError:
-        raise HTTPException(status_code=404, detail=f'Card not found: "{name}"')
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as e:
+        text = ""
+        try:
+            text = e.response.text[:200]
+        except Exception:
+            pass
+        raise HTTPException(status_code=e.response.status_code, detail=f"scryfall error: {text}")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"printings error: {e}")
 
+# ---- Commander summary (uses Scryfall REST + EDHREC) ------------------------
 @app.get("/commander/summary")
 async def commander_summary(name: str = Query(..., description="Commander name (exact or close)")):
+    """
+    Returns:
+      commander: oracle + color identity (from Scryfall)
+      edhrec: best-effort sections (high synergy, top cards, average deck sample)
+    """
     try:
-        commander = (await scry.cards.search_async(f'!"{name}" legal:commander game:paper'))[0]
-    except IndexError:
-        raise HTTPException(status_code=404, detail=f'Commander not found: "{name}"')
+        commander_card = await _scryfall_first(f'!"{name}" legal:commander game:paper')
+        if not commander_card:
+            raise HTTPException(status_code=404, detail=f'Commander not found: "{name}"')
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"scryfall error: {e}")
 
     edhrec_summary: Dict[str, Any] = {"high_synergy": [], "top_cards": [], "average_deck_sample": []}
     try:
-        page = await edh.commander_async(commander.name)
-        edhrec_summary["high_synergy"] = _extract_named_list(
+        page = await edh.commander_async(commander_card["name"])
+        edhrec_summary["high_synergy"] = _extract_named_list_from_edhrec(
             page, ["high_synergy", "high_synergy_cards", "synergies"]
         )[:40]
-        edhrec_summary["top_cards"] = _extract_named_list(
+        edhrec_summary["top_cards"] = _extract_named_list_from_edhrec(
             page, ["top_cards", "signature", "signature_cards", "commander_cards"]
         )[:60]
 
-        avg = await edh.average_deck_async(commander.name)
+        avg = await edh.average_deck_async(commander_card["name"])
         sample: List[str] = []
         for attr in ["cards", "main", "deck", "list"]:
             if hasattr(avg, attr):
@@ -203,19 +295,21 @@ async def commander_summary(name: str = Query(..., description="Commander name (
                 break
         edhrec_summary["average_deck_sample"] = list(dict.fromkeys(sample))
     except Exception:
+        # keep EDHREC fields empty on failure
         pass
 
     return {
         "commander": {
-            "name": commander.name,
-            "id": commander.id,
-            "oracle_text": getattr(commander, "oracle_text", None),
-            "type_line": getattr(commander, "type_line", None),
-            "color_identity": getattr(commander, "color_identity", None),
+            "name": commander_card.get("name"),
+            "id": commander_card.get("id"),
+            "oracle_text": commander_card.get("oracle_text"),
+            "type_line": commander_card.get("type_line"),
+            "color_identity": commander_card.get("color_identity"),
         },
         "edhrec": edhrec_summary,
     }
 
+# ---- Commander Spellbook (REST) ---------------------------------------------
 @app.get("/combos")
 async def combos(
     commander: Optional[str] = Query(None, description='Commander filter, e.g. "Miirym, Sentinel Wyrm"'),
@@ -264,17 +358,7 @@ async def combos(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"spellbook error: {e}")
 
-@app.get("/scryfall/autocomplete")
-async def scryfall_autocomplete(
-    q: str = Query(..., min_length=1, description="Partial card name"),
-    include_extras: bool = Query(False, description="Include funny/extra cards"),
-):
-    try:
-        catalog = await scry.autocomplete_async(q=q, include_extras=include_extras)
-        return {"data": catalog.data}
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Scryfall error: {e!s}")
-
+# ---- EDHREC combos index (Mightstone) ---------------------------------------
 @app.get("/edhrec/combos")
 async def edhrec_combos(
     identity: Optional[str] = Query(None, description="Optional color identity (e.g. 'w', 'ur', 'wubrg')."),
@@ -302,7 +386,7 @@ async def on_startup():
         transport=cache_transport,
         headers=DEFAULT_HEADERS,
         timeout=httpx.Timeout(10.0, connect=10.0),
-        http2=False,  # <-- FIX: disable HTTP/2, avoids 'h2' dependency
+        http2=False,  # keep HTTP/2 off (no 'h2' dep required)
     )
 
 @app.on_event("shutdown")
