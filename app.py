@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 import hishel
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -250,6 +251,115 @@ def _normalize_page_theme_payload(data: dict) -> dict:
 
     return {"header": header, "description": description, "container": {"collections": norm_collections}}
 
+async def _parse_edhrec_theme_html(theme_slug: str, identity: str) -> dict:
+    """
+    Direct HTML fallback for EDHREC theme pages, e.g.
+    https://edhrec.com/themes/prowess/wur
+    Returns the strict {header, description, container:{collections:[...]}} shape.
+    """
+    url = f"https://edhrec.com/themes/{theme_slug}/{identity}"
+    client: httpx.AsyncClient = app.state.httpx_client
+    r = await client.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html"})
+    if r.status_code == 404:
+        return {"header": "Unknown", "description": "", "container": {"collections": []}}
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # Header candidates
+    header = ""
+    h1 = soup.select_one("h1")
+    if h1 and h1.text.strip():
+        header = h1.text.strip()
+    if not header:
+        og_title = soup.select_one('meta[property="og:title"]')
+        if og_title and og_title.get("content"):
+            header = og_title["content"].strip()
+    if not header:
+        title = soup.select_one("title")
+        if title and title.text.strip():
+            header = title.text.strip()
+    if not header:
+        crumbs = soup.select(".breadcrumb li, .breadcrumbs li, nav[aria-label='breadcrumb'] li")
+        if crumbs:
+            header = crumbs[-1].get_text(strip=True) or "Unknown"
+    header = header or "Unknown"
+
+    # Description candidates
+    description = ""
+    for sel in [
+        ".theme__description",
+        ".theme-description",
+        ".theme__intro",
+        ".content__description",
+        ".page-subtitle",
+    ]:
+        node = soup.select_one(sel)
+        if node:
+            text = node.get_text(" ", strip=True)
+            if text:
+                description = text
+                break
+
+    # Collections / sections
+    collections: List[Dict[str, Any]] = []
+
+    sections = soup.select("section, .section, .view, .card-container, .cards, .theme__section, div[data-view]")
+
+    def cardnodes_in(container):
+        return container.select(
+            "a.card__name, .card__name a, .card__name, .card .name a, .card .name, .nw-card .name a"
+        )
+
+    seen_headers = set()
+    for sec in sections:
+        sec_header = ""
+        for hs in ["h2", "h3", ".section__title", ".section-title", ".view__title", ".cards__title"]:
+            hnode = sec.select_one(hs)
+            if hnode and hnode.get_text(strip=True):
+                sec_header = hnode.get_text(strip=True)
+                break
+        if not sec_header:
+            sec_header = sec.get("data-title", "") or sec.get("aria-label", "")
+
+        items: List[Dict[str, Any]] = []
+        for cn in cardnodes_in(sec):
+            name = cn.get_text(strip=True)
+            if not name:
+                continue
+            img = None
+            img_node = None
+            for candidate in [
+                cn.find_previous("img"),
+                cn.find_next("img"),
+                sec.select_one("img"),
+            ]:
+                if candidate:
+                    img_node = candidate
+                    break
+            if img_node:
+                img = img_node.get("data-src") or img_node.get("src")
+            items.append({"name": name, "id": None, "image": img})
+
+        if items:
+            tag = (sec_header or "").strip().lower()
+            if tag not in seen_headers:
+                seen_headers.add(tag)
+                collections.append({"header": sec_header or "Cards", "items": items})
+
+    if not collections:
+        global_cards = soup.select("a.card__name, .card__name a, .card .name a")
+        if global_cards:
+            items = []
+            for cn in global_cards:
+                nm = cn.get_text(strip=True)
+                if nm:
+                    items.append({"name": nm, "id": None, "image": None})
+            if items:
+                collections.append({"header": "Cards", "items": items})
+
+    return {"header": header, "description": description, "container": {"collections": collections}}
+
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
@@ -460,14 +570,14 @@ async def edhrec_combos(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"EDHREC error: {e!s}")
 
-# ---- EDHREC theme page (normalized + logged) --------------------------------
+# ---- EDHREC theme page (normalized + logged + HTML fallback) ----------------
 @app.get("/edhrec/theme")
 async def edhrec_theme(
     name: str = Query(..., description="Theme/Tag slug or name, e.g. 'prowess'"),
     identity: str = Query(..., description="Color identity letters, e.g. 'wur' for Jeskai"),
 ):
     """
-    Try Static client, then Proxied. Log raw payloads.
+    Try Static client, then Proxied, then direct HTML parse.
     Always return {header, description, container:{collections:[]}}.
     """
     theme_name = _normalize_theme_name(name)
@@ -475,34 +585,39 @@ async def edhrec_theme(
     if not norm_id:
         raise HTTPException(status_code=400, detail="Invalid identity; use W/U/B/R/G letters (e.g., 'wur').")
 
-    # --- Attempt 1: Static
+    # 1) Static Mightstone
     try:
         page = await edh.theme_async(name=theme_name, identity=norm_id)
         raw = _to_dict(page)
-        logger.debug("[EDHREC STATIC] theme=%s id=%s type=%s keys=%s",
-                     theme_name, norm_id, type(raw), list(raw.keys())[:10])
-        logger.debug("[EDHREC STATIC] preview=%s", _peek(raw))
+        logger.debug("[EDHREC STATIC] theme=%s id=%s keys=%s", theme_name, norm_id, list(raw.keys())[:10])
         shaped = _normalize_page_theme_payload(raw)
-        if shaped["header"] == "Unknown" and not shaped["container"]["collections"]:
-            logger.warning("Static client returned empty-ish payload; switching to proxied.")
-            raise RuntimeError("Empty static payload")
-        return shaped
+        if shaped["header"] != "Unknown" or shaped["container"]["collections"]:
+            return shaped
+        logger.warning("Static client returned empty-ish payload; falling through.")
     except Exception as e:
         logger.info("Static theme fetch failed: %s", e)
 
-    # --- Attempt 2: Proxied
+    # 2) Proxied Mightstone
     try:
         edh_proxy = EdhRecProxiedStatic(transport=cache_transport)
         page = await edh_proxy.theme_async(name=theme_name, identity=norm_id)
         raw = _to_dict(page)
-        logger.debug("[EDHREC PROXIED] theme=%s id=%s type=%s keys=%s",
-                     theme_name, norm_id, type(raw), list(raw.keys())[:10])
-        logger.debug("[EDHREC PROXIED] preview=%s", _peek(raw))
+        logger.debug("[EDHREC PROXIED] theme=%s id=%s keys=%s", theme_name, norm_id, list(raw.keys())[:10])
         shaped = _normalize_page_theme_payload(raw)
-        return shaped
+        if shaped["header"] != "Unknown" or shaped["container"]["collections"]:
+            return shaped
+        logger.warning("Proxied client returned empty-ish payload; falling through.")
     except Exception as e2:
-        logger.exception("Proxied theme fetch failed: %s", e2)
-        # Last-resort empty but valid shell (prevents validator crash)
+        logger.info("Proxied theme fetch failed: %s", e2)
+
+    # 3) Direct HTML parse fallback
+    try:
+        shaped = await _parse_edhrec_theme_html(theme_name, norm_id)
+        logger.debug("[EDHREC HTML] theme=%s id=%s header=%s collections=%d",
+                     theme_name, norm_id, shaped.get("header"), len(shaped.get("container", {}).get("collections", [])))
+        return shaped
+    except Exception as e3:
+        logger.exception("HTML fallback failed: %s", e3)
         return {"header": "Unknown", "description": "", "container": {"collections": []}}
 
 # ---- EDHREC theme RAW (debug) -----------------------------------------------
