@@ -91,23 +91,19 @@ app.add_middleware(
 LOG_LEVEL = os.environ.get("MIGHTSTONE_LOG_LEVEL") or ("DEBUG" if os.environ.get("MIGHTSTONE_DEBUG") else "INFO")
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("mightstone-bridge")
-# Optional: very verbose deps
 # logging.getLogger("httpx").setLevel(logging.DEBUG)
 # logging.getLogger("hishel").setLevel(logging.DEBUG)
 
 # -----------------------------------------------------------------------------
 # Clients
 # -----------------------------------------------------------------------------
-# EDHREC through Mightstone (uses our cached transport)
 edh = EdhRecStatic(transport=cache_transport)
 
 # -----------------------------------------------------------------------------
 # Identity mapping (letters -> EDHREC faction segment)
 # -----------------------------------------------------------------------------
 def _normalize_identity(identity: str) -> str:
-    """Keep letters only (wubrgc), lowercase, unique."""
     letters = [ch for ch in identity.lower() if ch in "wubrgc"]
-    # unique in original order
     out = []
     for ch in letters:
         if ch not in out:
@@ -122,8 +118,6 @@ _ID_MONO = {
     "g": "green",
     "c": "colorless",
 }
-
-# Two-color guilds
 _ID_GUILDS = {
     frozenset("wu"): "azorius",
     frozenset("ub"): "dimir",
@@ -136,8 +130,6 @@ _ID_GUILDS = {
     frozenset("rw"): "boros",
     frozenset("gu"): "simic",
 }
-
-# Three-color shards/wedges
 _ID_SHARDS_WEDGES = {
     frozenset("wub"): "esper",
     frozenset("ubr"): "grixis",
@@ -152,27 +144,16 @@ _ID_SHARDS_WEDGES = {
 }
 
 def _identity_to_edhrec_segment(identity: str) -> str:
-    """
-    Map color identity letters to EDHREC's path segment used under /tags/<theme>/<segment>.
-    Examples: 'w'->'white', 'ub'->'dimir', 'wur'->'jeskai', 'wubrg'->'five-color'.
-    Fallback to the raw letters if unknown.
-    """
     ident = _normalize_identity(identity)
     s = frozenset(ch for ch in ident if ch in "wubrg")
-
-    # Five color
     if s == frozenset("wubrg"):
         return "five-color"
-    # Mono + colorless
     if ident in _ID_MONO:
         return _ID_MONO[ident]
-    # Guilds
     if s in _ID_GUILDS:
         return _ID_GUILDS[s]
-    # Shards/Wedges
     if s in _ID_SHARDS_WEDGES:
         return _ID_SHARDS_WEDGES[s]
-    # Unknown combo -> raw letters
     return ident or "colorless"
 
 # -----------------------------------------------------------------------------
@@ -191,7 +172,6 @@ def _card_lite_from_scryfall_card(c: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 def _normalize_theme_name(name: str) -> str:
-    """EDHREC uses lowercase hyphenated slugs for tags/themes."""
     return re.sub(r"\s+", "-", name.strip().lower())
 
 def _extract_named_list_from_edhrec(obj: Any, candidate_attrs: List[str]) -> List[str]:
@@ -311,13 +291,104 @@ def _normalize_page_theme_payload(data: dict) -> dict:
     return {"header": header, "description": description, "container": {"collections": norm_collections}}
 
 # -----------------------------------------------------------------------------
-# Hardened HTML parser (uses /tags/<theme>/<segment>)
+# EDHREC Theme Extraction (Next.js JSON + HTML fallback)
 # -----------------------------------------------------------------------------
-async def _parse_edhrec_theme_html(theme_slug: str, identity: str) -> dict:
-    """
-    Fetches https://edhrec.com/tags/<theme>/<segment>
-    where <segment> is guild/shard/wedge/mono name (e.g., 'jeskai', 'dimir', 'white', 'five-color').
-    """
+def _collect_cards_from_next(obj: Any) -> List[Dict[str, Any]]:
+    """Walk arbitrary nested dict/list and yield items that look like cards."""
+    out: List[Dict[str, Any]] = []
+    def visit(x):
+        if isinstance(x, dict):
+            # Heuristics for a card-like object
+            name = x.get("name") or x.get("cardname") or x.get("card_name")
+            if isinstance(name, str) and name.strip():
+                img = x.get("image") or x.get("image_normal") or x.get("image_url")
+                cid = x.get("scryfall_id") or x.get("id")
+                out.append({"name": name.strip(), "id": cid, "image": img})
+            for v in x.values():
+                visit(v)
+        elif isinstance(x, list):
+            for v in x:
+                visit(v)
+    visit(obj)
+    # Dedup by name
+    seen = set()
+    dedup: List[Dict[str, Any]] = []
+    for it in out:
+        nm = it.get("name")
+        if nm and nm not in seen:
+            seen.add(nm)
+            dedup.append(it)
+    return dedup
+
+def _collections_from_next(page_props: dict) -> List[Dict[str, Any]]:
+    """Try to build logical sections from Next.js data."""
+    cols: List[Dict[str, Any]] = []
+
+    # Common buckets we’ve seen on EDHREC
+    buckets = [
+        ("High Synergy", ["high_synergy", "highSynergy", "high_synergy_cards"]),
+        ("Top Cards", ["top", "top_cards", "signature", "signature_cards"]),
+        ("New Cards", ["new_cards", "recent_cards"]),
+        ("Commanders", ["commanders", "leaders"]),
+        ("Creatures", ["creatures"]),
+        ("Instants", ["instants"]),
+        ("Sorceries", ["sorceries"]),
+        ("Artifacts", ["artifacts"]),
+        ("Enchantments", ["enchantments"]),
+        ("Planeswalkers", ["planeswalkers"]),
+        ("Lands", ["lands"]),
+    ]
+
+    for header, keys in buckets:
+        for k in keys:
+            if k in page_props:
+                items = _collect_cards_from_next(page_props[k])
+                if items:
+                    cols.append({"header": header, "items": items})
+                    break
+
+    # If nothing matched, try scanning for generic sections-like arrays
+    if not cols:
+        # Look for arrays of objects with "name" keys
+        for key, val in page_props.items():
+            if isinstance(val, list) and val and isinstance(val[0], dict) and "name" in val[0]:
+                items = _collect_cards_from_next(val)
+                if items:
+                    cols.append({"header": key.replace("_", " ").title(), "items": items})
+
+    return cols
+
+async def _fetch_next_data(client: httpx.AsyncClient, url: str, headers: dict) -> Optional[dict]:
+    """Fetch HTML, parse __NEXT_DATA__ JSON, return its props/pageProps dict if found."""
+    r = await client.get(url, headers=headers, follow_redirects=True)
+    if r.status_code != 200 or not r.text:
+        return None
+    soup = BeautifulSoup(r.text, "html.parser")
+    script = soup.find("script", id="__NEXT_DATA__", type="application/json")
+    if not script or not script.text:
+        return None
+    try:
+        data = json.loads(script.text)
+        # Next.js structure: { props: { pageProps: {...} } } OR { pageProps: {...} }
+        props = data.get("props") or {}
+        page_props = props.get("pageProps") or data.get("pageProps") or {}
+        return page_props
+    except Exception:
+        return None
+
+async def _fetch_json_mirror(client: httpx.AsyncClient, theme_slug: str, segment: str, headers: dict) -> Optional[dict]:
+    """Try the json.edhrec.com mirror: /tags/<theme>/<segment>.json"""
+    json_url = f"https://json.edhrec.com/tags/{theme_slug}/{segment}.json"
+    r = await client.get(json_url, headers=headers, follow_redirects=True)
+    if r.status_code != 200:
+        return None
+    try:
+        return r.json()
+    except Exception:
+        return None
+
+async def _parse_edhrec_theme(theme_slug: str, identity: str) -> dict:
+    """Best-effort extraction via Next.js JSON first, then HTML heuristics."""
     segment = _identity_to_edhrec_segment(identity)
     url = f"https://edhrec.com/tags/{theme_slug}/{segment}"
     client: httpx.AsyncClient = app.state.httpx_client
@@ -325,115 +396,66 @@ async def _parse_edhrec_theme_html(theme_slug: str, identity: str) -> dict:
     headers = dict(BROWSER_HEADERS)
     headers["Referer"] = f"https://edhrec.com/tags/{segment}"
 
-    r = await client.get(url, headers=headers, follow_redirects=True)
-    status = r.status_code
-    text_start = (r.text or "")[:600]
-    logger.debug("[EDHREC FETCH] %s -> %s\n%s", url, status, text_start.replace("\n", " ")[:600])
-
-    # Challenge/blocked detection
-    if status in (403, 503) or any(
-        s in text_start.lower()
-        for s in (
-            "cf-chl-bypass", "cloudflare", "attention required",
-            "please enable javascript", "checking your browser"
-        )
-    ):
-        logger.warning("Likely blocked/challenged by EDHREC/Cloudflare (status=%s).", status)
-        return {"header": "Unknown", "description": "", "container": {"collections": []}}
-
-    if status == 404:
-        return {"header": "Unknown", "description": "", "container": {"collections": []}}
-
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    # ---- Header
+    # 1) Next.js inlined data
+    page_props = await _fetch_next_data(client, url, headers=headers)
     header = ""
-    h1 = soup.select_one("h1")
-    if h1 and h1.get_text(strip=True):
-        header = h1.get_text(strip=True)
-    if not header:
-        og = soup.select_one('meta[property="og:title"]')
-        if og and og.get("content"):
-            header = og["content"].strip()
-    if not header:
-        title = soup.select_one("title")
-        if title and title.get_text(strip=True):
-            header = title.get_text(strip=True)
-    header = header or f"{segment.title()} {theme_slug.replace('-', ' ').title()}"
-
-    # ---- Description
     description = ""
-    for sel in (".theme__description", ".theme-description", ".theme__intro", ".content__description", ".page-subtitle"):
-        node = soup.select_one(sel)
-        if node:
-            txt = node.get_text(" ", strip=True)
-            if txt:
-                description = txt
-                break
-
-    # ---- Sections/Collections
-    section_nodes = soup.select(".theme__panel, .card-container, .card__container, section, .section, div[data-view]")
-
-    def extract_card_nodes(container):
-        return container.select("a.card__link, span.card__name, .card__name a, .nw-card .name a, .card .name a")
-
-    def find_img_near(node, scope):
-        cand = node.find("img") or node.find_previous("img") or node.find_next("img") or scope.select_one("img")
-        if not cand:
-            return None
-        return cand.get("data-src") or cand.get("data-original") or cand.get("src")
-
     collections: List[Dict[str, Any]] = []
-    seen_headers = set()
 
-    for sec in section_nodes:
-        sec_header = ""
-        for hdr_sel in ("h2", "h3", ".section__title", ".section-title", ".view__title", ".cards__title"):
-            hnode = sec.select_one(hdr_sel)
-            if hnode and hnode.get_text(strip=True):
-                sec_header = hnode.get_text(strip=True)
+    if page_props:
+        # Header/description from props if present
+        for key in ("title", "header", "pageTitle"):
+            if isinstance(page_props.get(key), str) and page_props[key].strip():
+                header = page_props[key].strip()
                 break
-        if not sec_header:
-            sec_header = sec.get("data-title", "") or sec.get("aria-label", "")
 
-        items: List[Dict[str, Any]] = []
-        for cn in extract_card_nodes(sec):
-            name = cn.get_text(strip=True)
-            if not name:
-                continue
-            img_url = find_img_near(cn, sec)
-            items.append({"name": name, "id": None, "image": img_url})
+        for key in ("description", "pageDescription"):
+            if isinstance(page_props.get(key), str):
+                description = page_props[key].strip() or description
 
-        if items:
-            tag = (sec_header or "Cards").strip().lower()
-            if tag not in seen_headers:
-                seen_headers.add(tag)
-                collections.append({"header": sec_header or "Cards", "items": items})
+        # Build collections from known buckets; if empty, scan generically
+        collections = _collections_from_next(page_props)
 
+    # 2) If still empty, try the JSON mirror
     if not collections:
-        global_cards = soup.select("a.card__link, span.card__name, .card__name a, .card .name a")
-        items = []
-        for cn in global_cards:
-            nm = cn.get_text(strip=True)
-            if nm:
-                items.append({"name": nm, "id": None, "image": None})
-        if items:
-            collections.append({"header": "Cards", "items": items})
+        mirror = await _fetch_json_mirror(client, theme_slug, segment, headers=headers)
+        if mirror:
+            # Mirror might wrap useful data under known keys; try pageProps then root
+            mirror_props = mirror.get("pageProps") if isinstance(mirror, dict) else None
+            source = mirror_props or mirror
+            collections = _collections_from_next(source)
+            if not header:
+                header = (source.get("title") or source.get("header") or f"{segment.title()} {theme_slug.replace('-', ' ').title()}") if isinstance(source, dict) else ""
+            if not description and isinstance(source, dict):
+                description = source.get("description") or ""
 
-    # Dedup within sections
+    # 3) If still empty, scrape minimal HTML (title/meta desc)
+    if not header or not description:
+        r = await client.get(url, headers=headers, follow_redirects=True)
+        soup = BeautifulSoup(r.text or "", "html.parser")
+        if not header:
+            t = soup.select_one("title")
+            if t and t.get_text(strip=True):
+                header = t.get_text(strip=True)
+        if not description:
+            md = soup.select_one('meta[name="description"]')
+            if md and md.get("content"):
+                description = md["content"].strip()
+
+    # Dedup items in each collection
     for col in collections:
         seen = set()
         dedup: List[Dict[str, Any]] = []
-        for it in col["items"]:
-            nm = it.get("name", "")
+        for it in col.get("items", []):
+            nm = (it or {}).get("name")
             if nm and nm not in seen:
                 seen.add(nm)
                 dedup.append(it)
         col["items"] = dedup
 
-    logger.debug("[EDHREC HTML PARSER] header=%s desc_len=%d sections=%d", header, len(description), len(collections))
-    return {"header": header, "description": description, "container": {"collections": collections}}
+    logger.debug("[EDHREC THEME] url=%s header=%s desc_len=%d sections=%d",
+                 url, header, len(description or ""), len(collections))
+    return {"header": header or "Unknown", "description": description or "", "container": {"collections": collections}}
 
 # -----------------------------------------------------------------------------
 # Routes
@@ -639,63 +661,48 @@ async def edhrec_combos(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"EDHREC error: {e!s}")
 
-# ---- EDHREC theme page (normalized + logged + HTML fallback) ----------------
+# ---- EDHREC theme (Next.js + mirror + minimal HTML) -------------------------
 @app.get("/edhrec/theme")
 async def edhrec_theme(
     name: str = Query(..., description="Theme/Tag slug or name, e.g. 'prowess'"),
     identity: str = Query(..., description="Color identity letters, e.g. 'wur' for Jeskai"),
 ):
-    """
-    Try Static client, then Proxied, then direct HTML parse (now using /tags/<theme>/<segment>).
-    Always return {header, description, container:{collections:[]}}.
-    """
     theme_name = _normalize_theme_name(name)
     norm_id = _normalize_identity(identity)
     if not norm_id:
         raise HTTPException(status_code=400, detail="Invalid identity; use W/U/B/R/G letters (e.g., 'wur').")
 
-    # 1) Static Mightstone
+    # Try Static Mightstone -> Proxied Mightstone
     try:
         page = await edh.theme_async(name=theme_name, identity=norm_id)
         raw = _to_dict(page)
-        logger.debug("[EDHREC STATIC] theme=%s id=%s keys=%s", theme_name, norm_id, list(raw.keys())[:10])
         shaped = _normalize_page_theme_payload(raw)
         if shaped["header"] != "Unknown" or shaped["container"]["collections"]:
             return shaped
-        logger.warning("Static client returned empty-ish payload; falling through.")
     except Exception as e:
         logger.info("Static theme fetch failed: %s", e)
 
-    # 2) Proxied Mightstone
     try:
         edh_proxy = EdhRecProxiedStatic(transport=cache_transport)
         page = await edh_proxy.theme_async(name=theme_name, identity=norm_id)
         raw = _to_dict(page)
-        logger.debug("[EDHREC PROXIED] theme=%s id=%s keys=%s", theme_name, norm_id, list(raw.keys())[:10])
         shaped = _normalize_page_theme_payload(raw)
         if shaped["header"] != "Unknown" or shaped["container"]["collections"]:
             return shaped
-        logger.warning("Proxied client returned empty-ish payload; falling through.")
     except Exception as e2:
         logger.info("Proxied theme fetch failed: %s", e2)
 
-    # 3) Direct HTML parse fallback (now against /tags/<theme>/<segment>)
+    # HTML/JSON Next.js pipeline
     try:
-        shaped = await _parse_edhrec_theme_html(theme_name, norm_id)
-        logger.debug("[EDHREC HTML] theme=%s id=%s header=%s collections=%d",
-                     theme_name, norm_id, shaped.get("header"), len(shaped.get("container", {}).get("collections", [])))
+        shaped = await _parse_edhrec_theme(theme_name, norm_id)
         return shaped
     except Exception as e3:
-        logger.exception("HTML fallback failed: %s", e3)
+        logger.exception("Theme parse failed: %s", e3)
         return {"header": "Unknown", "description": "", "container": {"collections": []}}
 
 # ---- EDHREC theme RAW (debug) -----------------------------------------------
 @app.get("/edhrec/theme_raw")
 async def edhrec_theme_raw(name: str, identity: str):
-    """
-    Debug endpoint to inspect the upstream Mightstone payload (static -> proxied).
-    Not intended for production consumption by GPT actions.
-    """
     theme_name = _normalize_theme_name(name)
     norm_id = _normalize_identity(identity)
     try:
@@ -710,10 +717,6 @@ async def edhrec_theme_raw(name: str, identity: str):
 # ---- EDHREC theme HTML preview (fetch debug via /tags) ----------------------
 @app.get("/edhrec/theme_debug")
 async def edhrec_theme_debug(name: str, identity: str, preview: int = 1000):
-    """
-    Returns the first N chars of the fetched EDHREC HTML (after browser-like headers),
-    against https://edhrec.com/tags/<theme>/<segment>.
-    """
     theme = _normalize_theme_name(name)
     segment = _identity_to_edhrec_segment(identity)
     url = f"https://edhrec.com/tags/{theme}/{segment}"
@@ -737,7 +740,7 @@ async def on_startup():
         transport=cache_transport,
         headers=DEFAULT_HEADERS,
         timeout=httpx.Timeout(10.0, connect=10.0),
-        http2=False,  # keep HTTP/2 off (no 'h2' dep required)
+        http2=False,
     )
 
 @app.on_event("shutdown")
