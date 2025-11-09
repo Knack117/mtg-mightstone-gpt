@@ -39,6 +39,26 @@ SPELLBOOK_BASE = "https://backend.commanderspellbook.com/api/combos"
 SCRYFALL_SEARCH_URL = "https://api.scryfall.com/cards/search"
 SCRYFALL_AUTOCOMPLETE_URL = "https://api.scryfall.com/cards/autocomplete"
 
+# Browser-like headers for EDHREC HTML fetching (to avoid simple bot challenges)
+BROWSER_HEADERS = {
+    "User-Agent": os.environ.get(
+        "BROWSER_UA",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "DNT": "1",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+
 # -----------------------------------------------------------------------------
 # Cached HTTP transport (Hishel + httpx)
 # -----------------------------------------------------------------------------
@@ -71,6 +91,9 @@ app.add_middleware(
 LOG_LEVEL = os.environ.get("MIGHTSTONE_LOG_LEVEL") or ("DEBUG" if os.environ.get("MIGHTSTONE_DEBUG") else "INFO")
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("mightstone-bridge")
+# Optional: uncomment for very verbose deps
+# logging.getLogger("httpx").setLevel(logging.DEBUG)
+# logging.getLogger("hishel").setLevel(logging.DEBUG)
 
 # -----------------------------------------------------------------------------
 # Clients
@@ -251,23 +274,47 @@ def _normalize_page_theme_payload(data: dict) -> dict:
 
     return {"header": header, "description": description, "container": {"collections": norm_collections}}
 
-# --- Robust HTML parser for EDHREC theme pages -------------------------------
+# --- Hardened HTML parser for EDHREC theme pages (browser headers + detection)
 async def _parse_edhrec_theme_html(theme_slug: str, identity: str) -> dict:
     """
-    Direct HTML fallback for EDHREC theme pages, e.g.
-      https://edhrec.com/themes/prowess/wur
-    Returns the strict {header, description, container:{collections:[...]}} shape.
+    Robust HTML parser for EDHREC theme pages with browser-like headers and
+    Cloudflare/challenge detection. Returns the strict normalized shape.
     """
     url = f"https://edhrec.com/themes/{theme_slug}/{identity.lower()}"
     client: httpx.AsyncClient = app.state.httpx_client
-    r = await client.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html"})
-    if r.status_code == 404:
-        return {"header": "Unknown", "description": "", "container": {"collections": []}}
-    r.raise_for_status()
 
+    # Send realistic browser headers; include a referer that looks natural.
+    headers = dict(BROWSER_HEADERS)
+    headers["Referer"] = f"https://edhrec.com/themes/{identity.lower()}"
+
+    r = await client.get(
+        url,
+        headers=headers,
+        follow_redirects=True,  # handle 30x
+    )
+
+    status = r.status_code
+    text_start = (r.text or "")[:600]
+    logger.debug("[EDHREC FETCH] %s -> %s\n%s", url, status, text_start.replace("\n", " ")[:600])
+
+    # If blocked or challenged
+    if status in (403, 503) or any(
+        s in text_start.lower()
+        for s in (
+            "cf-chl-bypass", "cloudflare", "attention required",
+            "please enable javascript", "checking your browser"
+        )
+    ):
+        logger.warning("Likely blocked/challenged by EDHREC/Cloudflare (status=%s).", status)
+        return {"header": "Unknown", "description": "", "container": {"collections": []}}
+
+    if status == 404:
+        return {"header": "Unknown", "description": "", "container": {"collections": []}}
+
+    r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # ---- Header (multiple fallbacks)
+    # ---- Header
     header = ""
     h1 = soup.select_one("h1")
     if h1 and h1.get_text(strip=True):
@@ -286,7 +333,7 @@ async def _parse_edhrec_theme_html(theme_slug: str, identity: str) -> dict:
             header = crumbs[-1].get_text(strip=True)
     header = header or f"{identity.upper()} {theme_slug.replace('-', ' ').title()} Theme"
 
-    # ---- Description (try a few common containers)
+    # ---- Description
     description = ""
     for sel in (".theme__description", ".theme-description", ".theme__intro", ".content__description", ".page-subtitle"):
         node = soup.select_one(sel)
@@ -296,26 +343,22 @@ async def _parse_edhrec_theme_html(theme_slug: str, identity: str) -> dict:
                 description = txt
                 break
 
-    # ---- Collections / sections
-    collections: List[Dict[str, Any]] = []
-
-    # Likely containers for card lists / sections
+    # ---- Sections/Collections
     section_nodes = soup.select(".theme__panel, .card-container, .card__container, section, .section, div[data-view]")
 
     def extract_card_nodes(container):
-        # Typical card name anchors/spans:
         return container.select("a.card__link, span.card__name, .card__name a, .nw-card .name a, .card .name a")
 
     def find_img_near(node, scope):
-        # EDHREC often lazy-loads via data-src / data-original
         cand = node.find("img") or node.find_previous("img") or node.find_next("img") or scope.select_one("img")
         if not cand:
             return None
         return cand.get("data-src") or cand.get("data-original") or cand.get("src")
 
+    collections: List[Dict[str, Any]] = []
     seen_headers = set()
+
     for sec in section_nodes:
-        # Section header (h2/h3 or common title classes/attributes)
         sec_header = ""
         for hdr_sel in ("h2", "h3", ".section__title", ".section-title", ".view__title", ".cards__title"):
             hnode = sec.select_one(hdr_sel)
@@ -325,7 +368,6 @@ async def _parse_edhrec_theme_html(theme_slug: str, identity: str) -> dict:
         if not sec_header:
             sec_header = sec.get("data-title", "") or sec.get("aria-label", "")
 
-        # Gather cards in this section
         items: List[Dict[str, Any]] = []
         for cn in extract_card_nodes(sec):
             name = cn.get_text(strip=True)
@@ -334,14 +376,12 @@ async def _parse_edhrec_theme_html(theme_slug: str, identity: str) -> dict:
             img_url = find_img_near(cn, sec)
             items.append({"name": name, "id": None, "image": img_url})
 
-        # Append only meaningful sections (and avoid dup headers)
         if items:
             tag = (sec_header or "Cards").strip().lower()
             if tag not in seen_headers:
                 seen_headers.add(tag)
                 collections.append({"header": sec_header or "Cards", "items": items})
 
-    # Global fallback: if no sections found, sweep page-wide card names
     if not collections:
         global_cards = soup.select("a.card__link, span.card__name, .card__name a, .card .name a")
         items = []
@@ -352,7 +392,7 @@ async def _parse_edhrec_theme_html(theme_slug: str, identity: str) -> dict:
         if items:
             collections.append({"header": "Cards", "items": items})
 
-    # Final normalization (dedupe names within each section)
+    # Dedup within sections
     for col in collections:
         seen = set()
         dedup: List[Dict[str, Any]] = []
@@ -363,10 +403,7 @@ async def _parse_edhrec_theme_html(theme_slug: str, identity: str) -> dict:
                 dedup.append(it)
         col["items"] = dedup
 
-    logger.debug(
-        "[EDHREC HTML PARSER] url=%s header=%s desc_len=%d sections=%d",
-        url, header, len(description), len(collections)
-    )
+    logger.debug("[EDHREC HTML PARSER] header=%s desc_len=%d sections=%d", header, len(description), len(collections))
     return {"header": header, "description": description, "container": {"collections": collections}}
 
 # -----------------------------------------------------------------------------
@@ -646,6 +683,25 @@ async def edhrec_theme_raw(name: str, identity: str):
         edh_proxy = EdhRecProxiedStatic(transport=cache_transport)
         page = await edh_proxy.theme_async(name=theme_name, identity=norm_id)
         return {"source": "proxied", "raw": _to_dict(page)}
+
+# ---- EDHREC theme HTML preview (fetch debug) --------------------------------
+@app.get("/edhrec/theme_debug")
+async def edhrec_theme_debug(name: str, identity: str, preview: int = 1000):
+    """
+    Returns the first N chars of the fetched EDHREC HTML (after browser-like headers),
+    so you can confirm whether you're seeing the real theme page vs. a challenge page.
+    """
+    url = f"https://edhrec.com/themes/{_normalize_theme_name(name)}/{_normalize_identity(identity)}"
+    client: httpx.AsyncClient = app.state.httpx_client
+    headers = dict(BROWSER_HEADERS)
+    headers["Referer"] = f"https://edhrec.com/themes/{_normalize_identity(identity)}"
+    r = await client.get(url, headers=headers, follow_redirects=True)
+    text = r.text or ""
+    return {
+        "status": r.status_code,
+        "url": str(r.url),
+        "preview": text[: max(0, min(preview, 4000))],
+    }
 
 # -----------------------------------------------------------------------------
 # Lifecycle: shared httpx client
