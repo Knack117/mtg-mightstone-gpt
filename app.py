@@ -2,6 +2,9 @@
 import os
 import re
 import time
+import json
+import logging
+from dataclasses import asdict, is_dataclass
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -52,12 +55,6 @@ cache_transport = hishel.AsyncCacheTransport(
 DEFAULT_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 
 # -----------------------------------------------------------------------------
-# Clients
-# -----------------------------------------------------------------------------
-# EDHREC through Mightstone (uses our cached transport)
-edh = EdhRecStatic(transport=cache_transport)
-
-# -----------------------------------------------------------------------------
 # FastAPI app
 # -----------------------------------------------------------------------------
 app = FastAPI(title="Mightstone Bridge", version=APP_VERSION)
@@ -68,6 +65,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Logger
+LOG_LEVEL = os.environ.get("MIGHTSTONE_LOG_LEVEL") or ("DEBUG" if os.environ.get("MIGHTSTONE_DEBUG") else "INFO")
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("mightstone-bridge")
+
+# -----------------------------------------------------------------------------
+# Clients
+# -----------------------------------------------------------------------------
+# EDHREC through Mightstone (uses our cached transport)
+edh = EdhRecStatic(transport=cache_transport)
 
 # -----------------------------------------------------------------------------
 # Helpers (Scryfall + EDHREC + Spellbook)
@@ -160,9 +168,50 @@ def _spellbook_search(q: str, limit: int) -> List[Dict[str, Any]]:
 
     raise HTTPException(status_code=429, detail="Commander Spellbook rate limited; try again shortly.")
 
+def _to_dict(obj) -> dict:
+    """
+    Best-effort conversion of Mightstone/Pydantic/dataclass objects to dict.
+    Returns {} if it can't serialize.
+    """
+    try:
+        if obj is None:
+            return {}
+        if isinstance(obj, dict):
+            return obj
+        # Pydantic v2
+        if hasattr(obj, "model_dump") and callable(obj.model_dump):
+            return obj.model_dump()
+        # Pydantic v1
+        if hasattr(obj, "dict") and callable(obj.dict):
+            return obj.dict()
+        # Dataclass
+        if is_dataclass(obj):
+            return asdict(obj)
+        # Generic python object
+        if hasattr(obj, "__dict__"):
+            return dict(obj.__dict__)
+        # Fallback: JSON roundtrip if possible
+        try:
+            return json.loads(json.dumps(obj))
+        except Exception:
+            return {}
+    except Exception as e:
+        logger.exception("Serialization failed: %s", e)
+        return {}
+
+def _peek(obj: dict, n: int = 3) -> dict:
+    """Return a tiny preview of a dict for logs."""
+    if not isinstance(obj, dict):
+        return {"_non_dict_type": str(type(obj))}
+    out = {}
+    for i, (k, v) in enumerate(obj.items()):
+        if i >= n: break
+        out[k] = (list(v)[:2] if isinstance(v, list) else (str(v)[:200] if not isinstance(v, dict) else {"keys": list(v.keys())[:5]}))
+    return out
+
 def _normalize_page_theme_payload(data: dict) -> dict:
     """
-    Normalize any EDHREC/Mightstone PageTheme-like payload into:
+    Normalize any EDHREC/Mightstone theme payload into:
     {
       "header": str,
       "description": str,
@@ -173,31 +222,31 @@ def _normalize_page_theme_payload(data: dict) -> dict:
       }
     }
     """
-    header = data.get("header") or "Unknown"
-    description = data.get("description") or ""
-    container = data.get("container") or {}
+    header = (data or {}).get("header") or "Unknown"
+    description = (data or {}).get("description") or ""
+    container = (data or {}).get("container") or {}
     collections = container.get("collections") or container.get("sections") or []
 
     norm_collections: List[Dict[str, Any]] = []
-    for sec in collections if isinstance(collections, list) else []:
-        h = ""
-        items_src = []
-        if isinstance(sec, dict):
-            h = sec.get("header") or sec.get("title") or ""
-            items_src = sec.get("items") or sec.get("cardviews") or sec.get("cards") or []
-        # coerce items to [{name, id?, image?}]
-        out_items = []
-        for it in items_src if isinstance(items_src, list) else []:
-            if isinstance(it, dict):
-                out_items.append({
-                    "name": it.get("name") or it.get("card_name") or "",
-                    "id": it.get("id") or it.get("scryfall_id"),
-                    "image": it.get("image") or it.get("image_normal"),
-                })
-            else:
-                # best-effort for non-dict entries
-                out_items.append({"name": str(it), "id": None, "image": None})
-        norm_collections.append({"header": h, "items": out_items})
+    if isinstance(collections, list):
+        for sec in collections:
+            sec_header = ""
+            items_src = []
+            if isinstance(sec, dict):
+                sec_header = sec.get("header") or sec.get("title") or ""
+                items_src = sec.get("items") or sec.get("cardviews") or sec.get("cards") or []
+            items = []
+            if isinstance(items_src, list):
+                for it in items_src:
+                    if isinstance(it, dict):
+                        items.append({
+                            "name": it.get("name") or it.get("card_name") or "",
+                            "id": it.get("id") or it.get("scryfall_id"),
+                            "image": it.get("image") or it.get("image_normal"),
+                        })
+                    else:
+                        items.append({"name": str(it), "id": None, "image": None})
+            norm_collections.append({"header": sec_header, "items": items})
 
     return {"header": header, "description": description, "container": {"collections": norm_collections}}
 
@@ -411,36 +460,68 @@ async def edhrec_combos(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"EDHREC error: {e!s}")
 
-# ---- EDHREC theme page (normalized) -----------------------------------------
+# ---- EDHREC theme page (normalized + logged) --------------------------------
 @app.get("/edhrec/theme")
 async def edhrec_theme(
     name: str = Query(..., description="Theme/Tag slug or name, e.g. 'prowess'"),
     identity: str = Query(..., description="Color identity letters, e.g. 'wur' for Jeskai"),
 ):
     """
-    Fetch a Theme page (e.g., 'prowess' + 'wur') and return a normalized JSON:
-    { header, description, container: { collections: [...] } }
-    Tries the fast static client first; falls back to the proxied client.
+    Try Static client, then Proxied. Log raw payloads.
+    Always return {header, description, container:{collections:[]}}.
     """
     theme_name = _normalize_theme_name(name)
     norm_id = _normalize_identity(identity)
     if not norm_id:
-        raise HTTPException(status_code=400, detail="Invalid identity; use W/U/B/R/G letters (e.g., 'wur' for Jeskai).")
+        raise HTTPException(status_code=400, detail="Invalid identity; use W/U/B/R/G letters (e.g., 'wur').")
 
-    # Try static (fast)
+    # --- Attempt 1: Static
     try:
         page = await edh.theme_async(name=theme_name, identity=norm_id)
-        data = page.model_dump() if hasattr(page, "model_dump") else dict(page)
-        return _normalize_page_theme_payload(data)
+        raw = _to_dict(page)
+        logger.debug("[EDHREC STATIC] theme=%s id=%s type=%s keys=%s",
+                     theme_name, norm_id, type(raw), list(raw.keys())[:10])
+        logger.debug("[EDHREC STATIC] preview=%s", _peek(raw))
+        shaped = _normalize_page_theme_payload(raw)
+        if shaped["header"] == "Unknown" and not shaped["container"]["collections"]:
+            logger.warning("Static client returned empty-ish payload; switching to proxied.")
+            raise RuntimeError("Empty static payload")
+        return shaped
+    except Exception as e:
+        logger.info("Static theme fetch failed: %s", e)
+
+    # --- Attempt 2: Proxied
+    try:
+        edh_proxy = EdhRecProxiedStatic(transport=cache_transport)
+        page = await edh_proxy.theme_async(name=theme_name, identity=norm_id)
+        raw = _to_dict(page)
+        logger.debug("[EDHREC PROXIED] theme=%s id=%s type=%s keys=%s",
+                     theme_name, norm_id, type(raw), list(raw.keys())[:10])
+        logger.debug("[EDHREC PROXIED] preview=%s", _peek(raw))
+        shaped = _normalize_page_theme_payload(raw)
+        return shaped
+    except Exception as e2:
+        logger.exception("Proxied theme fetch failed: %s", e2)
+        # Last-resort empty but valid shell (prevents validator crash)
+        return {"header": "Unknown", "description": "", "container": {"collections": []}}
+
+# ---- EDHREC theme RAW (debug) -----------------------------------------------
+@app.get("/edhrec/theme_raw")
+async def edhrec_theme_raw(name: str, identity: str):
+    """
+    Debug endpoint to inspect the upstream Mightstone payload (static -> proxied).
+    Not intended for production consumption by GPT actions.
+    """
+    theme_name = _normalize_theme_name(name)
+    norm_id = _normalize_identity(identity)
+    try:
+        page = await edh.theme_async(name=theme_name, identity=norm_id)
+        raw = _to_dict(page)
+        return {"source": "static", "raw": raw}
     except Exception:
-        # Fallback to proxied (slower but more complete)
-        try:
-            edh_proxy = EdhRecProxiedStatic(transport=cache_transport)
-            page = await edh_proxy.theme_async(name=theme_name, identity=norm_id)
-            data = page.model_dump() if hasattr(page, "model_dump") else dict(page)
-            return _normalize_page_theme_payload(data)
-        except Exception as e2:
-            raise HTTPException(status_code=502, detail=f"EDHREC theme error: {e2!s}")
+        edh_proxy = EdhRecProxiedStatic(transport=cache_transport)
+        page = await edh_proxy.theme_async(name=theme_name, identity=norm_id)
+        return {"source": "proxied", "raw": _to_dict(page)}
 
 # -----------------------------------------------------------------------------
 # Lifecycle: shared httpx client
