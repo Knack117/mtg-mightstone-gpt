@@ -9,15 +9,18 @@ import hishel
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-# Mightstone (only used for EDHREC here; Scryfall is via REST)
-from mightstone.services.edhrec import EdhRecStatic
+# Mightstone (EDHREC); Scryfall is called via REST
+from mightstone.services.edhrec import EdhRecStatic, EdhRecProxiedStatic
 
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
 APP_NAME = "mtg-deckbuilding-mightstone"
 APP_VERSION = os.environ.get("RENDER_GIT_COMMIT", "dev")
-USER_AGENT = os.environ.get("HTTP_USER_AGENT", f"{APP_NAME}/{APP_VERSION} (+https://render.com)")
+USER_AGENT = os.environ.get(
+    "HTTP_USER_AGENT",
+    f"{APP_NAME}/{APP_VERSION} (+https://render.com)"
+)
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "30"))
 
 CACHE_DIR = (
@@ -67,7 +70,7 @@ app.add_middleware(
 )
 
 # -----------------------------------------------------------------------------
-# Helpers (Scryfall + Spellbook)
+# Helpers (Scryfall + EDHREC + Spellbook)
 # -----------------------------------------------------------------------------
 def _card_lite_from_scryfall_card(c: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -81,45 +84,15 @@ def _card_lite_from_scryfall_card(c: Dict[str, Any]) -> Dict[str, Any]:
         "collector_number": c.get("collector_number"),
     }
 
-async def _scryfall_search(q: str, limit: int) -> List[Dict[str, Any]]:
-    async with httpx.AsyncClient(
-        transport=cache_transport,
-        headers=DEFAULT_HEADERS,
-        timeout=httpx.Timeout(15.0, connect=10.0),
-    ) as client:
-        r = await client.get(SCRYFALL_SEARCH_URL, params={"q": q})
-        r.raise_for_status()
-        payload = r.json()
-        cards = payload.get("data", [])
-        return [_card_lite_from_scryfall_card(c) for c in cards[: max(1, min(limit, 100))]]
+def _normalize_identity(identity: str) -> str:
+    """Return letters in WUBRG(C) order, lowercase (e.g., 'Jeskai'/'wur' -> 'wur')."""
+    letters = set(re.findall(r"[wubrgc]", identity.lower()))
+    order = "wubrgc"
+    return "".join(ch for ch in order if ch in letters)
 
-async def _scryfall_autocomplete(q: str, include_extras: bool) -> List[str]:
-    params = {"q": q}
-    if include_extras:
-        params["include_extras"] = "true"
-    async with httpx.AsyncClient(
-        transport=cache_transport,
-        headers=DEFAULT_HEADERS,
-        timeout=httpx.Timeout(10.0, connect=10.0),
-    ) as client:
-        r = await client.get(SCRYFALL_AUTOCOMPLETE_URL, params=params)
-        r.raise_for_status()
-        payload = r.json()
-        return payload.get("data", [])
-
-async def _scryfall_first(q: str) -> Optional[Dict[str, Any]]:
-    """Return the first Scryfall card object for a query, or None."""
-    async with httpx.AsyncClient(
-        transport=cache_transport,
-        headers=DEFAULT_HEADERS,
-        timeout=httpx.Timeout(15.0, connect=10.0),
-    ) as client:
-        r = await client.get(SCRYFALL_SEARCH_URL, params={"q": q})
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
-        data = r.json().get("data", [])
-        return data[0] if data else None
+def _normalize_theme_name(name: str) -> str:
+    """EDHREC uses lowercase hyphenated slugs for themes/tags."""
+    return re.sub(r"\s+", "-", name.strip().lower())
 
 def _extract_named_list_from_edhrec(obj: Any, candidate_attrs: List[str]) -> List[str]:
     for attr in candidate_attrs:
@@ -142,11 +115,33 @@ def _extract_named_list_from_edhrec(obj: Any, candidate_attrs: List[str]) -> Lis
             return out
     return []
 
-def _normalize_identity(identity: str) -> str:
-    """Return letters in WUBRG(C) order, lowercase, from inputs like 'WUr', 'g', 'wubrg'."""
-    letters = set(re.findall(r"[wubrgc]", identity.lower()))
-    order = "wubrgc"
-    return "".join(ch for ch in order if ch in letters)
+async def _scryfall_search(q: str, limit: int) -> List[Dict[str, Any]]:
+    client: httpx.AsyncClient = app.state.httpx_client
+    r = await client.get(SCRYFALL_SEARCH_URL, params={"q": q})
+    r.raise_for_status()
+    payload = r.json()
+    cards = payload.get("data", [])
+    return [_card_lite_from_scryfall_card(c) for c in cards[: max(1, min(limit, 100))]]
+
+async def _scryfall_autocomplete(q: str, include_extras: bool) -> List[str]:
+    params = {"q": q}
+    if include_extras:
+        params["include_extras"] = "true"
+    client: httpx.AsyncClient = app.state.httpx_client
+    r = await client.get(SCRYFALL_AUTOCOMPLETE_URL, params=params)
+    r.raise_for_status()
+    payload = r.json()
+    return payload.get("data", [])
+
+async def _scryfall_first(q: str) -> Optional[Dict[str, Any]]:
+    """Return the first Scryfall card object for a query, or None."""
+    client: httpx.AsyncClient = app.state.httpx_client
+    r = await client.get(SCRYFALL_SEARCH_URL, params={"q": q})
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    return data[0] if data else None
 
 def _spellbook_search(q: str, limit: int) -> List[Dict[str, Any]]:
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
@@ -218,15 +213,13 @@ async def legal_printings(name: str = Query(..., description="Exact card name"))
         if not base:
             raise HTTPException(status_code=404, detail=f'Card not found: "{name}"')
 
-        # Use the resolved Scryfall name to fetch unique prints (includes extras)
-        async with httpx.AsyncClient(
-            transport=cache_transport,
-            headers=DEFAULT_HEADERS,
-            timeout=httpx.Timeout(15.0, connect=10.0),
-        ) as client:
-            r = await client.get(SCRYFALL_SEARCH_URL, params={"q": f'!"{base["name"]}" include:extras unique:prints'})
-            r.raise_for_status()
-            prints_payload = r.json().get("data", [])
+        client: httpx.AsyncClient = app.state.httpx_client
+        r = await client.get(
+            SCRYFALL_SEARCH_URL,
+            params={"q": f'!"{base["name"]}" include:extras unique:prints'},
+        )
+        r.raise_for_status()
+        prints_payload = r.json().get("data", [])
 
         return {
             "name": base["name"],
@@ -252,7 +245,7 @@ async def legal_printings(name: str = Query(..., description="Exact card name"))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"printings error: {e}")
 
-# ---- Commander summary (uses Scryfall REST + EDHREC) ------------------------
+# ---- Commander summary (Scryfall REST + EDHREC) -----------------------------
 @app.get("/commander/summary")
 async def commander_summary(name: str = Query(..., description="Commander name (exact or close)")):
     """
@@ -377,8 +370,36 @@ async def edhrec_combos(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"EDHREC error: {e!s}")
 
+# ---- EDHREC theme page (e.g., prowess + Jeskai) -----------------------------
+@app.get("/edhrec/theme")
+async def edhrec_theme(
+    name: str = Query(..., description="Theme/Tag slug or name, e.g. 'prowess'"),
+    identity: str = Query(..., description="Color identity letters, e.g. 'wur' for Jeskai"),
+):
+    """
+    Fetch a Theme page (e.g., 'prowess' + 'wur') as structured JSON.
+    Tries the fast static client first; falls back to the proxied client.
+    """
+    theme_name = _normalize_theme_name(name)
+    norm_id = _normalize_identity(identity)
+    if not norm_id:
+        raise HTTPException(status_code=400, detail="Invalid identity; use W/U/B/R/G letters (e.g., 'wur' for Jeskai).")
+
+    # Try static (fast)
+    try:
+        page = await edh.theme_async(name=theme_name, identity=norm_id)
+        return page.model_dump()
+    except Exception:
+        # Fallback to proxied (slower but more complete)
+        try:
+            edh_proxy = EdhRecProxiedStatic(transport=cache_transport)
+            page = await edh_proxy.theme_async(name=theme_name, identity=norm_id)
+            return page.model_dump()
+        except Exception as e2:
+            raise HTTPException(status_code=502, detail=f"EDHREC theme error: {e2!s}")
+
 # -----------------------------------------------------------------------------
-# Lifecycle: shared httpx client (optional)
+# Lifecycle: shared httpx client
 # -----------------------------------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
