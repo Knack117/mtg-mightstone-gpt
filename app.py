@@ -251,13 +251,14 @@ def _normalize_page_theme_payload(data: dict) -> dict:
 
     return {"header": header, "description": description, "container": {"collections": norm_collections}}
 
+# --- Robust HTML parser for EDHREC theme pages -------------------------------
 async def _parse_edhrec_theme_html(theme_slug: str, identity: str) -> dict:
     """
     Direct HTML fallback for EDHREC theme pages, e.g.
-    https://edhrec.com/themes/prowess/wur
+      https://edhrec.com/themes/prowess/wur
     Returns the strict {header, description, container:{collections:[...]}} shape.
     """
-    url = f"https://edhrec.com/themes/{theme_slug}/{identity}"
+    url = f"https://edhrec.com/themes/{theme_slug}/{identity.lower()}"
     client: httpx.AsyncClient = app.state.httpx_client
     r = await client.get(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html"})
     if r.status_code == 404:
@@ -266,98 +267,106 @@ async def _parse_edhrec_theme_html(theme_slug: str, identity: str) -> dict:
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # Header candidates
+    # ---- Header (multiple fallbacks)
     header = ""
     h1 = soup.select_one("h1")
-    if h1 and h1.text.strip():
-        header = h1.text.strip()
+    if h1 and h1.get_text(strip=True):
+        header = h1.get_text(strip=True)
     if not header:
-        og_title = soup.select_one('meta[property="og:title"]')
-        if og_title and og_title.get("content"):
-            header = og_title["content"].strip()
+        og = soup.select_one('meta[property="og:title"]')
+        if og and og.get("content"):
+            header = og["content"].strip()
     if not header:
         title = soup.select_one("title")
-        if title and title.text.strip():
-            header = title.text.strip()
+        if title and title.get_text(strip=True):
+            header = title.get_text(strip=True)
     if not header:
         crumbs = soup.select(".breadcrumb li, .breadcrumbs li, nav[aria-label='breadcrumb'] li")
         if crumbs:
-            header = crumbs[-1].get_text(strip=True) or "Unknown"
-    header = header or "Unknown"
+            header = crumbs[-1].get_text(strip=True)
+    header = header or f"{identity.upper()} {theme_slug.replace('-', ' ').title()} Theme"
 
-    # Description candidates
+    # ---- Description (try a few common containers)
     description = ""
-    for sel in [
-        ".theme__description",
-        ".theme-description",
-        ".theme__intro",
-        ".content__description",
-        ".page-subtitle",
-    ]:
+    for sel in (".theme__description", ".theme-description", ".theme__intro", ".content__description", ".page-subtitle"):
         node = soup.select_one(sel)
         if node:
-            text = node.get_text(" ", strip=True)
-            if text:
-                description = text
+            txt = node.get_text(" ", strip=True)
+            if txt:
+                description = txt
                 break
 
-    # Collections / sections
+    # ---- Collections / sections
     collections: List[Dict[str, Any]] = []
 
-    sections = soup.select("section, .section, .view, .card-container, .cards, .theme__section, div[data-view]")
+    # Likely containers for card lists / sections
+    section_nodes = soup.select(".theme__panel, .card-container, .card__container, section, .section, div[data-view]")
 
-    def cardnodes_in(container):
-        return container.select(
-            "a.card__name, .card__name a, .card__name, .card .name a, .card .name, .nw-card .name a"
-        )
+    def extract_card_nodes(container):
+        # Typical card name anchors/spans:
+        return container.select("a.card__link, span.card__name, .card__name a, .nw-card .name a, .card .name a")
+
+    def find_img_near(node, scope):
+        # EDHREC often lazy-loads via data-src / data-original
+        cand = node.find("img") or node.find_previous("img") or node.find_next("img") or scope.select_one("img")
+        if not cand:
+            return None
+        return cand.get("data-src") or cand.get("data-original") or cand.get("src")
 
     seen_headers = set()
-    for sec in sections:
+    for sec in section_nodes:
+        # Section header (h2/h3 or common title classes/attributes)
         sec_header = ""
-        for hs in ["h2", "h3", ".section__title", ".section-title", ".view__title", ".cards__title"]:
-            hnode = sec.select_one(hs)
+        for hdr_sel in ("h2", "h3", ".section__title", ".section-title", ".view__title", ".cards__title"):
+            hnode = sec.select_one(hdr_sel)
             if hnode and hnode.get_text(strip=True):
                 sec_header = hnode.get_text(strip=True)
                 break
         if not sec_header:
             sec_header = sec.get("data-title", "") or sec.get("aria-label", "")
 
+        # Gather cards in this section
         items: List[Dict[str, Any]] = []
-        for cn in cardnodes_in(sec):
+        for cn in extract_card_nodes(sec):
             name = cn.get_text(strip=True)
             if not name:
                 continue
-            img = None
-            img_node = None
-            for candidate in [
-                cn.find_previous("img"),
-                cn.find_next("img"),
-                sec.select_one("img"),
-            ]:
-                if candidate:
-                    img_node = candidate
-                    break
-            if img_node:
-                img = img_node.get("data-src") or img_node.get("src")
-            items.append({"name": name, "id": None, "image": img})
+            img_url = find_img_near(cn, sec)
+            items.append({"name": name, "id": None, "image": img_url})
 
+        # Append only meaningful sections (and avoid dup headers)
         if items:
-            tag = (sec_header or "").strip().lower()
+            tag = (sec_header or "Cards").strip().lower()
             if tag not in seen_headers:
                 seen_headers.add(tag)
                 collections.append({"header": sec_header or "Cards", "items": items})
 
+    # Global fallback: if no sections found, sweep page-wide card names
     if not collections:
-        global_cards = soup.select("a.card__name, .card__name a, .card .name a")
-        if global_cards:
-            items = []
-            for cn in global_cards:
-                nm = cn.get_text(strip=True)
-                if nm:
-                    items.append({"name": nm, "id": None, "image": None})
-            if items:
-                collections.append({"header": "Cards", "items": items})
+        global_cards = soup.select("a.card__link, span.card__name, .card__name a, .card .name a")
+        items = []
+        for cn in global_cards:
+            nm = cn.get_text(strip=True)
+            if nm:
+                items.append({"name": nm, "id": None, "image": None})
+        if items:
+            collections.append({"header": "Cards", "items": items})
 
+    # Final normalization (dedupe names within each section)
+    for col in collections:
+        seen = set()
+        dedup: List[Dict[str, Any]] = []
+        for it in col["items"]:
+            nm = it.get("name", "")
+            if nm and nm not in seen:
+                seen.add(nm)
+                dedup.append(it)
+        col["items"] = dedup
+
+    logger.debug(
+        "[EDHREC HTML PARSER] url=%s header=%s desc_len=%d sections=%d",
+        url, header, len(description), len(collections)
+    )
     return {"header": header, "description": description, "container": {"collections": collections}}
 
 # -----------------------------------------------------------------------------
