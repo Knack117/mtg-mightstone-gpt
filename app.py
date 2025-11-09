@@ -91,7 +91,7 @@ app.add_middleware(
 LOG_LEVEL = os.environ.get("MIGHTSTONE_LOG_LEVEL") or ("DEBUG" if os.environ.get("MIGHTSTONE_DEBUG") else "INFO")
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("mightstone-bridge")
-# Optional: uncomment for very verbose deps
+# Optional: very verbose deps
 # logging.getLogger("httpx").setLevel(logging.DEBUG)
 # logging.getLogger("hishel").setLevel(logging.DEBUG)
 
@@ -100,6 +100,80 @@ logger = logging.getLogger("mightstone-bridge")
 # -----------------------------------------------------------------------------
 # EDHREC through Mightstone (uses our cached transport)
 edh = EdhRecStatic(transport=cache_transport)
+
+# -----------------------------------------------------------------------------
+# Identity mapping (letters -> EDHREC faction segment)
+# -----------------------------------------------------------------------------
+def _normalize_identity(identity: str) -> str:
+    """Keep letters only (wubrgc), lowercase, unique."""
+    letters = [ch for ch in identity.lower() if ch in "wubrgc"]
+    # unique in original order
+    out = []
+    for ch in letters:
+        if ch not in out:
+            out.append(ch)
+    return "".join(out)
+
+_ID_MONO = {
+    "w": "white",
+    "u": "blue",
+    "b": "black",
+    "r": "red",
+    "g": "green",
+    "c": "colorless",
+}
+
+# Two-color guilds
+_ID_GUILDS = {
+    frozenset("wu"): "azorius",
+    frozenset("ub"): "dimir",
+    frozenset("br"): "rakdos",
+    frozenset("rg"): "gruul",
+    frozenset("gw"): "selesnya",
+    frozenset("wb"): "orzhov",
+    frozenset("ur"): "izzet",
+    frozenset("bg"): "golgari",
+    frozenset("rw"): "boros",
+    frozenset("gu"): "simic",
+}
+
+# Three-color shards/wedges
+_ID_SHARDS_WEDGES = {
+    frozenset("wub"): "esper",
+    frozenset("ubr"): "grixis",
+    frozenset("brg"): "jund",
+    frozenset("wrg"): "naya",
+    frozenset("wug"): "bant",
+    frozenset("wur"): "jeskai",
+    frozenset("ubg"): "sultai",
+    frozenset("wbr"): "mardu",
+    frozenset("urg"): "temur",
+    frozenset("wbg"): "abzan",
+}
+
+def _identity_to_edhrec_segment(identity: str) -> str:
+    """
+    Map color identity letters to EDHREC's path segment used under /tags/<theme>/<segment>.
+    Examples: 'w'->'white', 'ub'->'dimir', 'wur'->'jeskai', 'wubrg'->'five-color'.
+    Fallback to the raw letters if unknown.
+    """
+    ident = _normalize_identity(identity)
+    s = frozenset(ch for ch in ident if ch in "wubrg")
+
+    # Five color
+    if s == frozenset("wubrg"):
+        return "five-color"
+    # Mono + colorless
+    if ident in _ID_MONO:
+        return _ID_MONO[ident]
+    # Guilds
+    if s in _ID_GUILDS:
+        return _ID_GUILDS[s]
+    # Shards/Wedges
+    if s in _ID_SHARDS_WEDGES:
+        return _ID_SHARDS_WEDGES[s]
+    # Unknown combo -> raw letters
+    return ident or "colorless"
 
 # -----------------------------------------------------------------------------
 # Helpers (Scryfall + EDHREC + Spellbook)
@@ -116,14 +190,8 @@ def _card_lite_from_scryfall_card(c: Dict[str, Any]) -> Dict[str, Any]:
         "collector_number": c.get("collector_number"),
     }
 
-def _normalize_identity(identity: str) -> str:
-    """Return letters in WUBRG(C) order, lowercase (e.g., 'Jeskai'/'wur' -> 'wur')."""
-    letters = set(re.findall(r"[wubrgc]", identity.lower()))
-    order = "wubrgc"
-    return "".join(ch for ch in order if ch in letters)
-
 def _normalize_theme_name(name: str) -> str:
-    """EDHREC uses lowercase hyphenated slugs for themes/tags."""
+    """EDHREC uses lowercase hyphenated slugs for tags/themes."""
     return re.sub(r"\s+", "-", name.strip().lower())
 
 def _extract_named_list_from_edhrec(obj: Any, candidate_attrs: List[str]) -> List[str]:
@@ -166,7 +234,6 @@ async def _scryfall_autocomplete(q: str, include_extras: bool) -> List[str]:
     return payload.get("data", [])
 
 async def _scryfall_first(q: str) -> Optional[Dict[str, Any]]:
-    """Return the first Scryfall card object for a query, or None."""
     client: httpx.AsyncClient = app.state.httpx_client
     r = await client.get(SCRYFALL_SEARCH_URL, params={"q": q})
     if r.status_code == 404:
@@ -193,28 +260,19 @@ def _spellbook_search(q: str, limit: int) -> List[Dict[str, Any]]:
     raise HTTPException(status_code=429, detail="Commander Spellbook rate limited; try again shortly.")
 
 def _to_dict(obj) -> dict:
-    """
-    Best-effort conversion of Mightstone/Pydantic/dataclass objects to dict.
-    Returns {} if it can't serialize.
-    """
     try:
         if obj is None:
             return {}
         if isinstance(obj, dict):
             return obj
-        # Pydantic v2
         if hasattr(obj, "model_dump") and callable(obj.model_dump):
             return obj.model_dump()
-        # Pydantic v1
         if hasattr(obj, "dict") and callable(obj.dict):
             return obj.dict()
-        # Dataclass
         if is_dataclass(obj):
             return asdict(obj)
-        # Generic python object
         if hasattr(obj, "__dict__"):
             return dict(obj.__dict__)
-        # Fallback: JSON roundtrip if possible
         try:
             return json.loads(json.dumps(obj))
         except Exception:
@@ -223,29 +281,7 @@ def _to_dict(obj) -> dict:
         logger.exception("Serialization failed: %s", e)
         return {}
 
-def _peek(obj: dict, n: int = 3) -> dict:
-    """Return a tiny preview of a dict for logs."""
-    if not isinstance(obj, dict):
-        return {"_non_dict_type": str(type(obj))}
-    out = {}
-    for i, (k, v) in enumerate(obj.items()):
-        if i >= n: break
-        out[k] = (list(v)[:2] if isinstance(v, list) else (str(v)[:200] if not isinstance(v, dict) else {"keys": list(v.keys())[:5]}))
-    return out
-
 def _normalize_page_theme_payload(data: dict) -> dict:
-    """
-    Normalize any EDHREC/Mightstone theme payload into:
-    {
-      "header": str,
-      "description": str,
-      "container": {
-        "collections": [
-          {"header": str, "items": [{"name": str, "id": str|null, "image": str|null}]}
-        ]
-      }
-    }
-    """
     header = (data or {}).get("header") or "Unknown"
     description = (data or {}).get("description") or ""
     container = (data or {}).get("container") or {}
@@ -274,30 +310,27 @@ def _normalize_page_theme_payload(data: dict) -> dict:
 
     return {"header": header, "description": description, "container": {"collections": norm_collections}}
 
-# --- Hardened HTML parser for EDHREC theme pages (browser headers + detection)
+# -----------------------------------------------------------------------------
+# Hardened HTML parser (uses /tags/<theme>/<segment>)
+# -----------------------------------------------------------------------------
 async def _parse_edhrec_theme_html(theme_slug: str, identity: str) -> dict:
     """
-    Robust HTML parser for EDHREC theme pages with browser-like headers and
-    Cloudflare/challenge detection. Returns the strict normalized shape.
+    Fetches https://edhrec.com/tags/<theme>/<segment>
+    where <segment> is guild/shard/wedge/mono name (e.g., 'jeskai', 'dimir', 'white', 'five-color').
     """
-    url = f"https://edhrec.com/themes/{theme_slug}/{identity.lower()}"
+    segment = _identity_to_edhrec_segment(identity)
+    url = f"https://edhrec.com/tags/{theme_slug}/{segment}"
     client: httpx.AsyncClient = app.state.httpx_client
 
-    # Send realistic browser headers; include a referer that looks natural.
     headers = dict(BROWSER_HEADERS)
-    headers["Referer"] = f"https://edhrec.com/themes/{identity.lower()}"
+    headers["Referer"] = f"https://edhrec.com/tags/{segment}"
 
-    r = await client.get(
-        url,
-        headers=headers,
-        follow_redirects=True,  # handle 30x
-    )
-
+    r = await client.get(url, headers=headers, follow_redirects=True)
     status = r.status_code
     text_start = (r.text or "")[:600]
     logger.debug("[EDHREC FETCH] %s -> %s\n%s", url, status, text_start.replace("\n", " ")[:600])
 
-    # If blocked or challenged
+    # Challenge/blocked detection
     if status in (403, 503) or any(
         s in text_start.lower()
         for s in (
@@ -327,11 +360,7 @@ async def _parse_edhrec_theme_html(theme_slug: str, identity: str) -> dict:
         title = soup.select_one("title")
         if title and title.get_text(strip=True):
             header = title.get_text(strip=True)
-    if not header:
-        crumbs = soup.select(".breadcrumb li, .breadcrumbs li, nav[aria-label='breadcrumb'] li")
-        if crumbs:
-            header = crumbs[-1].get_text(strip=True)
-    header = header or f"{identity.upper()} {theme_slug.replace('-', ' ').title()} Theme"
+    header = header or f"{segment.title()} {theme_slug.replace('-', ' ').title()}"
 
     # ---- Description
     description = ""
@@ -494,11 +523,6 @@ async def legal_printings(name: str = Query(..., description="Exact card name"))
 # ---- Commander summary (Scryfall REST + EDHREC) -----------------------------
 @app.get("/commander/summary")
 async def commander_summary(name: str = Query(..., description="Commander name (exact or close)")):
-    """
-    Returns:
-      commander: oracle + color identity (from Scryfall)
-      edhrec: best-effort sections (high synergy, top cards, average deck sample)
-    """
     try:
         commander_card = await _scryfall_first(f'!"{name}" legal:commander game:paper')
         if not commander_card:
@@ -534,7 +558,6 @@ async def commander_summary(name: str = Query(..., description="Commander name (
                 break
         edhrec_summary["average_deck_sample"] = list(dict.fromkeys(sample))
     except Exception:
-        # keep EDHREC fields empty on failure
         pass
 
     return {
@@ -623,7 +646,7 @@ async def edhrec_theme(
     identity: str = Query(..., description="Color identity letters, e.g. 'wur' for Jeskai"),
 ):
     """
-    Try Static client, then Proxied, then direct HTML parse.
+    Try Static client, then Proxied, then direct HTML parse (now using /tags/<theme>/<segment>).
     Always return {header, description, container:{collections:[]}}.
     """
     theme_name = _normalize_theme_name(name)
@@ -656,7 +679,7 @@ async def edhrec_theme(
     except Exception as e2:
         logger.info("Proxied theme fetch failed: %s", e2)
 
-    # 3) Direct HTML parse fallback
+    # 3) Direct HTML parse fallback (now against /tags/<theme>/<segment>)
     try:
         shaped = await _parse_edhrec_theme_html(theme_name, norm_id)
         logger.debug("[EDHREC HTML] theme=%s id=%s header=%s collections=%d",
@@ -684,17 +707,19 @@ async def edhrec_theme_raw(name: str, identity: str):
         page = await edh_proxy.theme_async(name=theme_name, identity=norm_id)
         return {"source": "proxied", "raw": _to_dict(page)}
 
-# ---- EDHREC theme HTML preview (fetch debug) --------------------------------
+# ---- EDHREC theme HTML preview (fetch debug via /tags) ----------------------
 @app.get("/edhrec/theme_debug")
 async def edhrec_theme_debug(name: str, identity: str, preview: int = 1000):
     """
     Returns the first N chars of the fetched EDHREC HTML (after browser-like headers),
-    so you can confirm whether you're seeing the real theme page vs. a challenge page.
+    against https://edhrec.com/tags/<theme>/<segment>.
     """
-    url = f"https://edhrec.com/themes/{_normalize_theme_name(name)}/{_normalize_identity(identity)}"
+    theme = _normalize_theme_name(name)
+    segment = _identity_to_edhrec_segment(identity)
+    url = f"https://edhrec.com/tags/{theme}/{segment}"
     client: httpx.AsyncClient = app.state.httpx_client
     headers = dict(BROWSER_HEADERS)
-    headers["Referer"] = f"https://edhrec.com/themes/{_normalize_identity(identity)}"
+    headers["Referer"] = f"https://edhrec.com/tags/{segment}"
     r = await client.get(url, headers=headers, follow_redirects=True)
     text = r.text or ""
     return {
