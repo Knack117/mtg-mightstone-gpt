@@ -130,30 +130,33 @@ Returns the unshaped Next.js payload straight from EDHREC for troubleshooting th
 **HTTP Endpoint**
 
 ```
-GET /edhrec/average-deck?name=<Commander Name>&bracket=<all|exhibition|core|upgraded|optimized|cedh|1..5>
+GET /edhrec/average-deck?name=<Commander Name>&bracket=<precon|upgraded>
 ```
 
-- `name`: commander’s printed name (e.g., `Avatar Aang`).
-- `bracket` (optional): defaults to `all`. Accepts human names or numeric aliases (1=exhibition, 2=core, 3=upgraded, 4=optimized, 5=cedh).
+- `name`: commander’s printed name (e.g., `Jodah, the Unifier`).
+- `bracket` (optional): defaults to `upgraded`. Accepts `precon` or `upgraded`.
 
 **Response Shape**
 
-- `header`: "{Commander} -- Average Deck ({BracketLabel})"
+- `commander`: the requested commander name.
+- `bracket`: normalized bracket (`precon` or `upgraded`).
 - `source_url`: EDHREC page used to build the list.
-- `container.collections[0].items`: normalized `{count, name}` deck entries.
+- `cards`: list of `{name, qty}` entries representing ~99 mainboard cards.
+- `commander_card` (optional): commander card metadata when EDHREC lists it separately.
+- `error`: `null` on success, otherwise `{message, url, details?}` describing the failure.
 
 **JIT Tool (for GPT)**
 
 - Tool: `edhrec_average_deck`
 - Params: `{ name, bracket? }`
 
-Example:
+Examples:
 
 ```
-GET https://mtg-mightstone-gpt.onrender.com/edhrec/average-deck
-  ?name=Donatello%2C%20the%20Brains%20%2F%2F%20Michelangelo%2C%20the%20Heart
+GET /edhrec/average_deck?name=Jodah,%20the%20Unifier&bracket=upgraded
+GET /edhrec/average_deck?name=Donatello,%20the%20Brains%20//%20Michelangelo,%20the%20Heart&bracket=upgraded
 
-tool: edhrec_average_deck name=Donatello, the Brains // Michelangelo, the Heart bracket=all
+tool: edhrec_average_deck name=Donatello, the Brains // Michelangelo, the Heart bracket=upgraded
 ```
 
 ## EDHREC Themes via Mightstone
