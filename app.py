@@ -5,11 +5,13 @@ import logging
 import os
 import re
 import time
+from datetime import date
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from utils.commander_identity import normalize_commander_name
@@ -37,6 +39,68 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s"
 )
 log = logging.getLogger("mightstone")
+
+# -----------------------------------------------------------------------------
+# Privacy Policy
+# -----------------------------------------------------------------------------
+PRIVACY_CONTACT_EMAIL = os.getenv("PRIVACY_CONTACT_EMAIL", "contact@example.com")
+PRIVACY_LAST_UPDATED = date.today().isoformat()
+
+PRIVACY_HTML = f"""<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8">
+  <title>Mightstone Privacy Policy</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex">
+  <style>
+    body {{max-width: 860px; margin: 2rem auto; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; line-height: 1.6; padding: 0 1rem;}}
+    h1, h2 {{line-height: 1.2;}}
+    code, pre {{background:#f6f8fa; padding: .2rem .3rem; border-radius: 4px;}}
+    .muted {{color:#666}}
+  </style>
+</head><body>
+  <h1>Mightstone Privacy Policy</h1>
+  <p class="muted">Last updated: {PRIVACY_LAST_UPDATED}</p>
+
+  <h2>1. Introduction</h2>
+  <p>Mightstone (“we”, “us”, “our”) provides features via a custom GPT and HTTP endpoints hosted at this service.
+  This page explains how we collect, use, and share information when you use Mightstone.</p>
+
+  <h2>2. Information We Collect</h2>
+  <ul>
+    <li>Inputs you send to our endpoints/actions (e.g., search queries, commander names).</li>
+    <li>Basic operational metadata (timestamps, request/response status, performance metrics).</li>
+  </ul>
+  <p>We do not intentionally collect highly sensitive personal data. Do not submit such data.</p>
+
+  <h2>3. How We Use Information</h2>
+  <ul>
+    <li>To fulfill your requests and operate the service.</li>
+    <li>To maintain security, monitor abuse, and improve reliability.</li>
+  </ul>
+
+  <h2>4. Sharing & Disclosure</h2>
+  <p>We do not sell personal data. We may share limited data with service providers (e.g., hosting) under confidentiality and security obligations or when required by law.</p>
+
+  <h2>5. Data Retention</h2>
+  <p>We retain data only as long as necessary for the purposes described above or to comply with legal obligations, after which we delete or anonymize it.</p>
+
+  <h2>6. Your Rights</h2>
+  <p>Depending on your jurisdiction, you may have rights to access, correct, or delete your personal information, and to object or restrict certain processing. Contact us to exercise these rights.</p>
+
+  <h2>7. Security</h2>
+  <p>We use reasonable technical and organizational measures to protect information, but no system is 100% secure.</p>
+
+  <h2>8. Children’s Privacy</h2>
+  <p>Our service is not directed to children under 13 and we do not knowingly collect information from them.</p>
+
+  <h2>9. Changes</h2>
+  <p>We may update this policy. We will post updates here and adjust the “Last updated” date.</p>
+
+  <h2>10. Contact</h2>
+  <p>Email: <a href="mailto:{PRIVACY_CONTACT_EMAIL}">{PRIVACY_CONTACT_EMAIL}</a></p>
+
+</body></html>"""
 
 # -----------------------------------------------------------------------------
 # Models
@@ -624,6 +688,13 @@ async def hydrate_items(
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy():
+    return HTMLResponse(content=PRIVACY_HTML, media_type="text/html; charset=utf-8")
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health():
     return HealthResponse(status="ok")
