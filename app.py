@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -25,6 +26,8 @@ EDHREC_BASE = "https://edhrec.com"
 # Scryfall: be respectful; their docs suggest ~10 req/s cap. We’ll be far lower.
 SCRYFALL_MAX_CONCURRENCY = int(os.environ.get("SCRYFALL_MAX_CONCURRENCY", "4"))
 SCRYFALL_DELAY_SECONDS = float(os.environ.get("SCRYFALL_DELAY_SECONDS", "0.12"))  # ~8/s theoretical cap
+SCRYFALL_MAX_RETRIES = int(os.environ.get("SCRYFALL_MAX_RETRIES", "4"))
+SCRYFALL_CACHE_TTL_SECONDS = float(os.environ.get("SCRYFALL_CACHE_TTL_SECONDS", "3600"))
 
 logging.basicConfig(
     level=os.environ.get("LOGLEVEL", "INFO"),
@@ -80,6 +83,7 @@ async def on_startup():
     app.state.client = httpx.AsyncClient(timeout=http_timeout, headers=default_headers, http2=False)
     app.state.scryfall = httpx.AsyncClient(timeout=http_timeout, headers={"User-Agent": USER_AGENT}, http2=False)
     app.state.sf_sem = asyncio.Semaphore(SCRYFALL_MAX_CONCURRENCY)
+    app.state.scryfall_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
     log.info("HTTP clients created.")
 
 @app.on_event("shutdown")
@@ -229,40 +233,90 @@ async def fetch_theme_tag(name: str, identity: str) -> PageTheme:
 # -----------------------------------------------------------------------------
 # Helpers: Scryfall lookups (exact-name)
 # -----------------------------------------------------------------------------
+def _extract_image_url(card_data: Dict[str, Any], image_size: str) -> Optional[str]:
+    """Pull an image URL out of Scryfall card JSON for the requested size."""
+    if not image_size:
+        return None
+
+    iu = card_data.get("image_uris")
+    if isinstance(iu, dict) and image_size in iu:
+        return iu.get(image_size)
+
+    faces = card_data.get("card_faces")
+    if isinstance(faces, list):
+        for face in faces:
+            if not isinstance(face, dict):
+                continue
+            iu2 = face.get("image_uris")
+            if isinstance(iu2, dict) and image_size in iu2:
+                return iu2.get(image_size)
+    return None
+
+
 async def scryfall_named_exact(name: str, image_size: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
     """
     Returns (scryfall_id, image_url_or_none) for an exact name match.
     image_size: one of None | 'small' | 'normal' | 'large' | 'png' | 'art_crop' | 'border_crop'
     """
+    cache: Dict[str, Tuple[float, Dict[str, Any]]] = getattr(app.state, "scryfall_cache", {})
+    key = name.strip().lower()
+    now = time.monotonic()
+
+    # Cache hit?
+    if key in cache:
+        cached_at, cached_payload = cache[key]
+        if now - cached_at <= SCRYFALL_CACHE_TTL_SECONDS and cached_payload:
+            sid = cached_payload.get("id")
+            img_url = _extract_image_url(cached_payload, image_size) if image_size else None
+            return sid, img_url
+        # Drop stale / empty cache entries
+        if now - cached_at > SCRYFALL_CACHE_TTL_SECONDS:
+            cache.pop(key, None)
+
     # Guard: Scryfall exact match wants printable names; leave quotes out, we’ll use url params.
     params = {"exact": name}
     url = f"{SCRYFALL_BASE}/cards/named"
-    async with app.state.sf_sem:
-        r = await app.state.scryfall.get(url, params=params)
-        # polite spacing
-        await asyncio.sleep(SCRYFALL_DELAY_SECONDS)
-    if r.status_code != 200:
-        return None, None
-    data = r.json()
+    backoff = SCRYFALL_DELAY_SECONDS
 
-    sid = data.get("id")
-    img_url = None
+    for attempt in range(SCRYFALL_MAX_RETRIES):
+        async with app.state.sf_sem:
+            r = await app.state.scryfall.get(url, params=params)
+            # polite spacing regardless of outcome
+            await asyncio.sleep(SCRYFALL_DELAY_SECONDS)
 
-    if image_size:
-        # Prefer single-faced image_uris
-        iu = data.get("image_uris")
-        if isinstance(iu, dict) and image_size in iu:
-            img_url = iu.get(image_size)
-        else:
-            # Try card_faces
-            faces = data.get("card_faces")
-            if isinstance(faces, list) and faces:
-                first = faces[0]
-                iu2 = first.get("image_uris") if isinstance(first, dict) else None
-                if isinstance(iu2, dict) and image_size in iu2:
-                    img_url = iu2.get(image_size)
+        if r.status_code == 200:
+            data = r.json()
+            cache[key] = (time.monotonic(), data)
+            sid = data.get("id")
+            img_url = _extract_image_url(data, image_size) if image_size else None
+            return sid, img_url
 
-    return sid, img_url
+        if r.status_code in (429,) or 500 <= r.status_code < 600:
+            retry_after_header = r.headers.get("Retry-After")
+            if retry_after_header:
+                try:
+                    retry_delay = float(retry_after_header)
+                except ValueError:
+                    retry_delay = backoff
+            else:
+                retry_delay = backoff
+            log.warning(
+                "Scryfall exact lookup retry %s/%s for %r (status %s)",
+                attempt + 1,
+                SCRYFALL_MAX_RETRIES,
+                name,
+                r.status_code,
+            )
+            await asyncio.sleep(retry_delay)
+            backoff = min(backoff * 2, 5.0)
+            continue
+
+        log.warning(
+            "Scryfall exact lookup failed for %r: %s %s", name, r.status_code, r.text[:200]
+        )
+        break
+
+    return None, None
 
 async def hydrate_items(
     items: List[ThemeItem],
