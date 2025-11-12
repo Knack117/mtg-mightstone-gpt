@@ -43,7 +43,7 @@ log = logging.getLogger("mightstone")
 # -----------------------------------------------------------------------------
 # Privacy Policy
 # -----------------------------------------------------------------------------
-PRIVACY_CONTACT_EMAIL = os.getenv("PRIVACY_CONTACT_EMAIL", "contact@example.com")
+PRIVACY_CONTACT_EMAIL = os.getenv("PRIVACY_CONTACT_EMAIL", "pommnetwork@gmail.com")
 PRIVACY_LAST_UPDATED = date.today().isoformat()
 
 PRIVACY_HTML = f"""<!doctype html>

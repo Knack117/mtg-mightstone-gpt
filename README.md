@@ -205,7 +205,7 @@ Mightstone serves a public privacy policy at:
 - `GET /privacy` → HTML page (no auth, HTTPS on Render)
 
 This URL can be used in OpenAI’s “Privacy policy URL” field to publish the GPT publicly.
-You can set the contact email with `PRIVACY_CONTACT_EMAIL` (defaults to `contact@example.com`).
+You can set the contact email with `PRIVACY_CONTACT_EMAIL` (defaults to `pommnetwork@gmail.com`).
 
 Run the page in your browser to confirm it exists and shows card lists.
 
