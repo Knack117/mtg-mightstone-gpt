@@ -727,7 +727,9 @@ def privacy():
     return HTMLResponse(content=PRIVACY_HTML, media_type="text/html; charset=utf-8")
 
 
-@app.get("/edhrec/average_deck")
+# Maintain the legacy underscore route for backward compatibility but prefer the hyphenated path.
+@app.get("/edhrec/average-deck")
+@app.get("/edhrec/average_deck", include_in_schema=False)
 def edhrec_average_deck(
     name: str = Query(..., description="Commander name (printed name)"),
     bracket: str = Query(
