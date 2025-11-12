@@ -104,6 +104,36 @@ curl -sG "http://localhost:8080/cards/search" \
   --data-urlencode 'q=! "Monastery Mentor"' \
   --data-urlencode 'limit=5' | jq .
 
+## EDHREC Themes via Mightstone
+
+Primary endpoint:
+
+```
+GET https://mtg-mightstone-gpt.onrender.com/edhrec/theme?name={theme}&identity={code}
+```
+
+- `name`: EDHREC tag (lowercase), e.g. `zombies`, `prowess`, `aristocrats`
+- `identity`: canonical color code sorted W→U→B→R→G (e.g., `wur` for Jeskai)
+
+Examples:
+
+```bash
+curl -sG "https://mtg-mightstone-gpt.onrender.com/edhrec/theme" \
+  --data-urlencode "name=prowess" \
+  --data-urlencode "identity=wur"
+
+curl -sG "https://mtg-mightstone-gpt.onrender.com/edhrec/theme" \
+  --data-urlencode "name=aristocrats" \
+  --data-urlencode "identity=bg"
+```
+
+Direct EDHREC URL (debugging only):
+
+Use slugs, not codes:
+
+- ✅ `/tags/zombies/mono-black`, `/tags/prowess/jeskai`
+- ❌ `/tags/zombies/b`, `/tags/prowess/wur`
+
 Request Parameters
 /edhrec/theme
 
@@ -111,11 +141,9 @@ name (required) — EDHREC tag (e.g., prowess, spellslinger, etc.)
 
 identity (required) — Color identity:
 
-wur / rwu → jeskai
-
-wubrg → five-color
-
-otherwise literal (e.g., grixis, azorius)
+- Accepts color codes ("wur"), labels ("Jeskai"), or slugs ("jeskai").
+- Codes are canonicalized to W→U→B→R→G order.
+- Slugs map to EDHREC color words (e.g., mono-black, izzet, witch-maw).
 
 /edhrec/theme_hydrated
 
