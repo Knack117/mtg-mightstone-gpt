@@ -198,6 +198,15 @@ Empty collections or placeholder data
 
 Check the endpoint you’re targeting: this service currently supports Tag pages (/tags/<theme>/<colorWord>), not arbitrary EDHREC routes.
 
+## Privacy Policy
+
+Mightstone serves a public privacy policy at:
+
+- `GET /privacy` → HTML page (no auth, HTTPS on Render)
+
+This URL can be used in OpenAI’s “Privacy policy URL” field to publish the GPT publicly.
+You can set the contact email with `PRIVACY_CONTACT_EMAIL` (defaults to `pommnetwork@gmail.com`).
+
 Run the page in your browser to confirm it exists and shows card lists.
 
 Some Next.js keys evolve; we use a robust “find arrays of named items” strategy, but open an issue if a specific tag returns nothing.
