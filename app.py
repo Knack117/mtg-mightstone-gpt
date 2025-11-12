@@ -12,6 +12,8 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from utils.identity import canonicalize_identity
+
 # -----------------------------------------------------------------------------
 # Config & Logging
 # -----------------------------------------------------------------------------
@@ -54,6 +56,7 @@ class PageTheme(BaseModel):
     header: str
     description: str
     container: ThemeContainer
+    source_url: Optional[str] = None
 
 class HealthResponse(BaseModel):
     status: str
@@ -188,23 +191,22 @@ async def fetch_theme_tag(name: str, identity: str) -> PageTheme:
     """
     Pulls the EDHREC Tag (e.g., /tags/prowess/jeskai) Next.js JSON and builds a PageTheme.
     """
-    tag_slug = name.strip().lower()
-    # EDHREC uses color words here, not WUR
-    color_word = {
-        "wur": "jeskai", "rwu": "jeskai",
-        "wubrg": "five-color",
-    }.get(identity.lower(), identity.lower())
+    tag_slug = (name or "").strip().lower()
+    try:
+        _code, label, color_slug = canonicalize_identity(identity)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    tag_html_url = f"{EDHREC_BASE}/tags/{tag_slug}/{color_word}"
+    tag_html_url = f"{EDHREC_BASE}/tags/{tag_slug}/{color_slug}"
     html = await _fetch_text(tag_html_url)
     header, description = _extract_title_description_from_head(html)
 
     build_id = _extract_build_id_from_html(html)
     if not build_id:
         # Fallback: try the tags JSON without an explicit buildId (EDHREC often accepts this form)
-        json_url = f"{EDHREC_BASE}/_next/data/{'C2WISSDrnMBiFoK_iJlSk'}/tags/{tag_slug}/{color_word}.json"
+        json_url = f"{EDHREC_BASE}/_next/data/{'C2WISSDrnMBiFoK_iJlSk'}/tags/{tag_slug}/{color_slug}.json"
     else:
-        json_url = f"{EDHREC_BASE}/_next/data/{build_id}/tags/{tag_slug}/{color_word}.json"
+        json_url = f"{EDHREC_BASE}/_next/data/{build_id}/tags/{tag_slug}/{color_slug}.json"
 
     data = await _fetch_json(json_url)
 
@@ -224,10 +226,14 @@ async def fetch_theme_tag(name: str, identity: str) -> PageTheme:
         items = [ThemeItem(name=n) for n in buckets[k]]
         collections.append(ThemeCollection(header=k, items=items))
 
+    if not header:
+        header = f"{label} {tag_slug.title()} | EDHREC"
+
     return PageTheme(
         header=header,
         description=description,
-        container=ThemeContainer(collections=collections)
+        container=ThemeContainer(collections=collections),
+        source_url=tag_html_url,
     )
 
 # -----------------------------------------------------------------------------
