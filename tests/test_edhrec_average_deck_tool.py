@@ -12,8 +12,7 @@ def test_tool_registered():
     assert "edhrec_average_deck" in TOOL_REGISTRY
 
 
-def test_bracket_aliases():
-    from handlers.edhrec_average_deck import BRACKET_MAP
+def test_valid_brackets():
+    from handlers.edhrec_average_deck import VALID_BRACKETS
 
-    assert BRACKET_MAP["1"] == "exhibition"
-    assert BRACKET_MAP["5"] == "cedh"
+    assert VALID_BRACKETS == {"precon", "upgraded"}

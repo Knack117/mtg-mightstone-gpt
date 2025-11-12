@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from utils.commander_identity import normalize_commander_name
-from utils.edhrec_average import fetch_average_deck
+from services.edhrec import EdhrecError, fetch_average_deck
 from utils.identity import canonicalize_identity
 
 # -----------------------------------------------------------------------------
@@ -733,16 +733,28 @@ def privacy():
 def edhrec_average_deck(
     name: str = Query(..., description="Commander name (printed name)"),
     bracket: str = Query(
-        "all",
-        description="Average deck bracket (all|exhibition|core|upgraded|optimized|cedh|1..5)",
+        "upgraded",
+        description="Average deck bracket (precon|upgraded)",
     ),
 ):
+    normalized_bracket = (bracket or "upgraded").strip().lower()
+    if normalized_bracket not in {"precon", "upgraded"}:
+        raise HTTPException(status_code=400, detail="Bracket must be 'precon' or 'upgraded'")
+
     try:
-        return fetch_average_deck(name=name, bracket=bracket)
+        payload = fetch_average_deck(name=name, bracket=normalized_bracket)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except EdhrecError as exc:
+        error_payload = exc.to_dict()
+        return {"error": error_payload}
     except HTTPException:
         raise
     except Exception as exc:  # pragma: no cover - safeguard
         raise HTTPException(status_code=502, detail=f"Failed to fetch average deck: {exc}") from exc
+
+    payload["error"] = None
+    return payload
 
 
 @app.get("/health", response_model=HealthResponse)
