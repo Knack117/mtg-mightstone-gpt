@@ -9,6 +9,7 @@ from datetime import date
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
+import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -731,30 +732,74 @@ def privacy():
 @app.get("/edhrec/average-deck")
 @app.get("/edhrec/average_deck", include_in_schema=False)
 def edhrec_average_deck(
-    name: str = Query(..., description="Commander name (printed name)"),
-    bracket: str = Query(
-        "upgraded",
-        description="Average deck bracket (precon|upgraded)",
+    name: Optional[str] = Query(None, description="Commander name (printed name)"),
+    bracket: Optional[str] = Query(
+        None,
+        description="Average deck bracket (e.g., precon, upgraded, budget)",
+    ),
+    source_url: Optional[str] = Query(
+        None,
+        description="Direct EDHREC average-decks URL (skips discovery)",
     ),
 ):
-    normalized_bracket = (bracket or "upgraded").strip().lower()
-    if normalized_bracket not in {"precon", "upgraded"}:
-        raise HTTPException(status_code=400, detail="Bracket must be 'precon' or 'upgraded'")
+    normalized_name = name.strip() if isinstance(name, str) else None
+    normalized_bracket = bracket.strip().lower() if isinstance(bracket, str) else None
 
+    if not source_url:
+        if not normalized_name:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "NAME_REQUIRED", "message": "Commander name is required"},
+            )
+        if not normalized_bracket:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "BRACKET_REQUIRED", "message": "Bracket is required"},
+            )
+
+    session = requests.Session()
     try:
-        payload = fetch_average_deck(name=name, bracket=normalized_bracket)
+        payload = fetch_average_deck(
+            name=normalized_name,
+            bracket=normalized_bracket,
+            source_url=source_url,
+            session=session,
+        )
     except ValueError as exc:
+        detail = exc.args[0] if exc.args else str(exc)
+        if isinstance(detail, dict):
+            raise HTTPException(status_code=400, detail=detail) from exc
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except EdhrecError as exc:
-        error_payload = exc.to_dict()
-        return {"error": error_payload}
+        return {"error": exc.to_dict()}
     except HTTPException:
         raise
     except Exception as exc:  # pragma: no cover - safeguard
         raise HTTPException(status_code=502, detail=f"Failed to fetch average deck: {exc}") from exc
+    finally:
+        session.close()
 
-    payload["error"] = None
-    return payload
+    response: Dict[str, Any] = {
+        "cards": payload.get("cards", []),
+        "commander_card": payload.get("commander_card"),
+        "meta": {
+            "source_url": payload.get("source_url"),
+            "resolved_bracket": payload.get("bracket"),
+            "request": {
+                "name": name,
+                "bracket": bracket,
+                "source_url": source_url,
+            },
+        },
+        "error": None,
+    }
+
+    if payload.get("commander"):
+        response["meta"]["commander"] = payload["commander"]
+    if "available_brackets" in payload:
+        response["meta"]["available_brackets"] = payload["available_brackets"]
+
+    return response
 
 
 @app.get("/health", response_model=HealthResponse)
