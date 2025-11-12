@@ -28,6 +28,7 @@ Endpoints
 Method	Path	Purpose
 GET	/health	Service health check.
 GET	/edhrec/theme	Fetch EDHREC tag page for a theme & color identity (e.g. prowess + wur → Jeskai).
+GET	/edhrec/theme_nextdebug	Return the raw EDHREC tag payload for debugging a theme query.
 GET	/edhrec/theme_hydrated	Same as /edhrec/theme, then hydrates items with Scryfall IDs (and optionally images).
 GET	/cards/search	Thin pass-through to Scryfall’s /cards/search for debugging/hydration.
 GET	/edhrec/average_deck	Fetch EDHREC “Average Deck” list for a commander (all or bracketed lists).
@@ -87,6 +88,16 @@ curl -sG "http://localhost:8080/edhrec/theme" ^
   --data-urlencode "name=prowess" ^
   --data-urlencode "identity=wur"
 
+Debugging Endpoint – Raw EDHREC Payload
+curl -sG "http://localhost:8080/edhrec/theme_nextdebug" \
+  --data-urlencode "name=prowess" \
+  --data-urlencode "identity=wur" | jq .
+
+# Example 404 (unknown theme)
+curl -sG "http://localhost:8080/edhrec/theme_nextdebug" \
+  --data-urlencode "name=totally-made-up-theme" \
+  --data-urlencode "identity=wur" -w "\nHTTP %{http_code}\n"
+
 Hydrated Theme (adds Scryfall IDs, optional images)
 # No images (default) – best for GPT/tooling
 curl -sG "http://localhost:8080/edhrec/theme_hydrated" \
@@ -104,6 +115,15 @@ Scryfall Search (debug)
 curl -sG "http://localhost:8080/cards/search" \
   --data-urlencode 'q=! "Monastery Mentor"' \
   --data-urlencode 'limit=5' | jq .
+
+### Debugging Endpoint
+
+`GET /edhrec/theme_nextdebug?name=<theme>&identity=<colors>`
+
+Returns the unshaped Next.js payload straight from EDHREC for troubleshooting theme extractions.
+
+- 404 → Not Found when EDHREC has no data for the requested combination.
+- 502 → Upstream error for timeouts, 5xxs, or malformed responses.
 
 ### EDHREC Average Decks
 

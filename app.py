@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from utils.commander_identity import normalize_commander_name
@@ -203,20 +203,36 @@ def _camel_or_snake_to_title(value: str) -> str:
 
 async def _fetch_text(url: str) -> str:
     log.info('HTTP GET %s', url)
-    r = await app.state.client.get(url, follow_redirects=True)
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Upstream fetch failed ({r.status_code} {url})")
-    return r.text
+    try:
+        response = await app.state.client.get(url, follow_redirects=True)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 502
+        if status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Resource not found ({url})") from exc
+        raise HTTPException(status_code=502, detail=f"Upstream fetch failed ({status_code} {url})") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Upstream request failed ({url})") from exc
+    return response.text
+
 
 async def _fetch_json(url: str) -> Any:
     log.info('HTTP GET %s', url)
-    r = await app.state.client.get(url, follow_redirects=True)
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Upstream JSON fetch failed ({r.status_code} {url})")
     try:
-        return r.json()
-    except Exception:
-        raise HTTPException(status_code=502, detail=f"Invalid JSON from {url}")
+        response = await app.state.client.get(url, follow_redirects=True)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        status_code = exc.response.status_code if exc.response is not None else 502
+        if status_code == 404:
+            raise HTTPException(status_code=404, detail=f"Resource not found ({url})") from exc
+        raise HTTPException(status_code=502, detail=f"Upstream JSON fetch failed ({status_code} {url})") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Upstream JSON request failed ({url})") from exc
+
+    try:
+        return response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Invalid JSON from {url}") from exc
 
 def _snakecase(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
@@ -527,10 +543,7 @@ async def commander_summary_handler(name: str) -> Dict[str, Any]:
     )
     return page.dict()
 
-async def fetch_theme_tag(name: str, identity: str) -> PageTheme:
-    """
-    Pulls the EDHREC Tag (e.g., /tags/prowess/jeskai) Next.js JSON and builds a PageTheme.
-    """
+async def _fetch_theme_resources(name: str, identity: str) -> Dict[str, Any]:
     tag_slug = (name or "").strip().lower()
     try:
         _code, label, color_slug = canonicalize_identity(identity)
@@ -543,15 +556,32 @@ async def fetch_theme_tag(name: str, identity: str) -> PageTheme:
 
     build_id = _extract_build_id_from_html(html)
     if not build_id:
-        # Fallback: try the tags JSON without an explicit buildId (EDHREC often accepts this form)
         json_url = f"{EDHREC_BASE}/_next/data/{'C2WISSDrnMBiFoK_iJlSk'}/tags/{tag_slug}/{color_slug}.json"
     else:
         json_url = f"{EDHREC_BASE}/_next/data/{build_id}/tags/{tag_slug}/{color_slug}.json"
 
     data = await _fetch_json(json_url)
 
+    return {
+        "tag_slug": tag_slug,
+        "color_slug": color_slug,
+        "label": label,
+        "tag_html_url": tag_html_url,
+        "json_url": json_url,
+        "header": header,
+        "description": description,
+        "data": data,
+    }
+
+
+async def fetch_theme_tag(name: str, identity: str) -> PageTheme:
+    """
+    Pulls the EDHREC Tag (e.g., /tags/prowess/jeskai) Next.js JSON and builds a PageTheme.
+    """
+    resources = await _fetch_theme_resources(name, identity)
+
     # Heuristic extraction
-    buckets = _walk_for_named_arrays(data)
+    buckets = _walk_for_named_arrays(resources["data"])
     collections: List[ThemeCollection] = []
     # Prefer Cardviews + Cards if present
     ordered_keys = []
@@ -566,14 +596,15 @@ async def fetch_theme_tag(name: str, identity: str) -> PageTheme:
         items = [ThemeItem(name=n) for n in buckets[k]]
         collections.append(ThemeCollection(header=k, items=items))
 
+    header = resources["header"]
     if not header:
-        header = f"{label} {tag_slug.title()} | EDHREC"
+        header = f"{resources['label']} {resources['tag_slug'].title()} | EDHREC"
 
     return PageTheme(
         header=header,
-        description=description,
+        description=resources["description"],
         container=ThemeContainer(collections=collections),
-        source_url=tag_html_url,
+        source_url=resources["tag_html_url"],
     )
 
 # -----------------------------------------------------------------------------
@@ -747,6 +778,42 @@ async def edhrec_theme(
     except Exception as e:
         log.exception("Theme fetch failed.")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/edhrec/theme_nextdebug")
+async def edhrec_theme_nextdebug(
+    name: str = Query(..., description="EDHREC tag/theme name, e.g. 'prowess'"),
+    identity: str = Query(..., description="Color identity (e.g., 'wur' -> Jeskai)"),
+):
+    """Return the raw EDHREC payload for debugging theme extraction."""
+
+    try:
+        resources = await _fetch_theme_resources(name, identity)
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as exc:  # pragma: no cover - defensive
+        status_code = exc.response.status_code if exc.response is not None else 502
+        if status_code == 404:
+            raise HTTPException(status_code=404, detail="Not Found") from exc
+        raise HTTPException(status_code=502, detail="Upstream EDHREC error") from exc
+    except httpx.RequestError as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=502, detail="Upstream EDHREC request failed") from exc
+    except Exception as exc:
+        log.exception("Theme debug fetch failed.")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    debug_payload = {
+        "tag": resources["tag_slug"],
+        "identity": resources["color_slug"],
+        "label": resources["label"],
+        "header": resources["header"],
+        "description": resources["description"],
+        "tag_url": resources["tag_html_url"],
+        "json_url": resources["json_url"],
+        "data": resources["data"],
+    }
+
+    return JSONResponse(content=debug_payload)
 
 @app.get("/edhrec/theme_hydrated", response_model=PageTheme)
 async def edhrec_theme_hydrated(
