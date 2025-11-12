@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 import re
 
 import requests
 from bs4 import BeautifulSoup
 
-from .commander_identity import commander_to_slug
+from .commander_identity import commander_slug_candidates, commander_to_slug
 
 USER_AGENT = "MightstoneBot/1.0 (+https://mtg-mightstone-gpt.onrender.com)"
 TIMEOUT = 20
@@ -29,16 +29,21 @@ BRACKET_MAP = {
 }
 
 
-def build_average_url(name: str, bracket: str = "all") -> Tuple[str, str, str]:
-    """Return (slug, url, label) for an EDHREC average deck lookup."""
-
-    slug = commander_to_slug(name)
+def _normalize_bracket(bracket: str) -> Tuple[str, str]:
     key = (bracket or "all").strip().lower()
     key = BRACKET_MAP.get(key, key)
     if key and key not in BRACKET_MAP.values():
         key = ""
-    url = f"https://edhrec.com/average-decks/{slug}" + (f"/{key}" if key else "")
     label = "All" if not key else key.title()
+    return key, label
+
+
+def build_average_url(name: str, bracket: str = "all") -> Tuple[str, str, str]:
+    """Return (slug, url, label) for an EDHREC average deck lookup."""
+
+    slug = commander_to_slug(name)
+    key, label = _normalize_bracket(bracket)
+    url = f"https://edhrec.com/average-decks/{slug}" + (f"/{key}" if key else "")
     return slug, url, label
 
 
@@ -88,19 +93,45 @@ def extract_decklist(soup: BeautifulSoup) -> List[Dict[str, object]]:
 def fetch_average_deck(name: str, bracket: str = "all") -> Dict[str, object]:
     """Fetch an average deck for the supplied commander."""
 
-    slug, url, label = build_average_url(name, bracket)
-    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
-    response.raise_for_status()
-    soup = BeautifulSoup(response.text, "html.parser")
-    items = extract_decklist(soup)
+    key, label = _normalize_bracket(bracket)
+    slugs = commander_slug_candidates(name) or [commander_to_slug(name)]
+    last_error: Optional[Exception] = None
 
-    return {
-        "header": f"{name} — Average Deck ({label})",
-        "description": "",
-        "source_url": url,
-        "container": {
-            "collections": [
-                {"header": "Decklist", "items": items},
-            ]
-        },
-    }
+    for slug in slugs:
+        url = f"https://edhrec.com/average-decks/{slug}" + (f"/{key}" if key else "")
+        try:
+            response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+        except requests.RequestException as exc:
+            last_error = exc
+            continue
+
+        if response.status_code == 404:
+            last_error = requests.HTTPError(f"Average deck not found for slug '{slug}' (404)")
+            continue
+
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            last_error = exc
+            continue
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        items = extract_decklist(soup)
+        if items:
+            return {
+                "header": f"{name} — Average Deck ({label})",
+                "description": "",
+                "source_url": url,
+                "container": {
+                    "collections": [
+                        {"header": "Decklist", "items": items},
+                    ]
+                },
+            }
+
+        last_error = ValueError(f"Average deck page for slug '{slug}' did not include a decklist")
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError(f"Failed to fetch average deck for {name}")

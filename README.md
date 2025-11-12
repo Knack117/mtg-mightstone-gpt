@@ -31,7 +31,7 @@ GET	/edhrec/theme	Fetch EDHREC tag page for a theme & color identity (e.g. prowe
 GET	/edhrec/theme_nextdebug	Return the raw EDHREC tag payload for debugging a theme query.
 GET	/edhrec/theme_hydrated	Same as /edhrec/theme, then hydrates items with Scryfall IDs (and optionally images).
 GET	/cards/search	Thin pass-through to Scryfall’s /cards/search for debugging/hydration.
-GET	/edhrec/average_deck	Fetch EDHREC “Average Deck” list for a commander (all or bracketed lists).
+GET	/edhrec/average-deck	Fetch EDHREC “Average Deck” list for a commander (all or bracketed lists).
 (optional)	/docs	FastAPI Swagger UI (auto-generated).
 (optional)	/openapi.json	FastAPI OpenAPI spec (auto-generated).
 
@@ -130,7 +130,7 @@ Returns the unshaped Next.js payload straight from EDHREC for troubleshooting th
 **HTTP Endpoint**
 
 ```
-GET /edhrec/average_deck?name=<Commander Name>&bracket=<all|exhibition|core|upgraded|optimized|cedh|1..5>
+GET /edhrec/average-deck?name=<Commander Name>&bracket=<all|exhibition|core|upgraded|optimized|cedh|1..5>
 ```
 
 - `name`: commander’s printed name (e.g., `Avatar Aang`).
@@ -146,6 +146,15 @@ GET /edhrec/average_deck?name=<Commander Name>&bracket=<all|exhibition|core|upgr
 
 - Tool: `edhrec_average_deck`
 - Params: `{ name, bracket? }`
+
+Example:
+
+```
+GET https://mtg-mightstone-gpt.onrender.com/edhrec/average-deck
+  ?name=Donatello%2C%20the%20Brains%20%2F%2F%20Michelangelo%2C%20the%20Heart
+
+tool: edhrec_average_deck name=Donatello, the Brains // Michelangelo, the Heart bracket=all
+```
 
 ## EDHREC Themes via Mightstone
 

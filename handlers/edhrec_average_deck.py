@@ -20,7 +20,7 @@ def edhrec_average_deck(name: str, bracket: str = "all"):
     b = (bracket or "all").strip().lower()
     b = BRACKET_MAP.get(b, b) or "all"
 
-    url = f"{MIGHTSTONE_BASE}/edhrec/average_deck?{urlencode({'name': name, 'bracket': b})}"
+    url = f"{MIGHTSTONE_BASE}/edhrec/average-deck?{urlencode({'name': name, 'bracket': b})}"
     r = requests.get(url, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()

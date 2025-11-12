@@ -17,5 +17,5 @@
     },
     "required": ["name"]
   },
-  "route": "/edhrec/average_deck"
+  "route": "/edhrec/average-deck"
 }
