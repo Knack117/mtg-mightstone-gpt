@@ -30,6 +30,7 @@ GET	/health	Service health check.
 GET	/edhrec/theme	Fetch EDHREC tag page for a theme & color identity (e.g. prowess + wur → Jeskai).
 GET	/edhrec/theme_hydrated	Same as /edhrec/theme, then hydrates items with Scryfall IDs (and optionally images).
 GET	/cards/search	Thin pass-through to Scryfall’s /cards/search for debugging/hydration.
+GET	/edhrec/average_deck	Fetch EDHREC “Average Deck” list for a commander (all or bracketed lists).
 (optional)	/docs	FastAPI Swagger UI (auto-generated).
 (optional)	/openapi.json	FastAPI OpenAPI spec (auto-generated).
 
@@ -103,6 +104,28 @@ Scryfall Search (debug)
 curl -sG "http://localhost:8080/cards/search" \
   --data-urlencode 'q=! "Monastery Mentor"' \
   --data-urlencode 'limit=5' | jq .
+
+### EDHREC Average Decks
+
+**HTTP Endpoint**
+
+```
+GET /edhrec/average_deck?name=<Commander Name>&bracket=<all|exhibition|core|upgraded|optimized|cedh|1..5>
+```
+
+- `name`: commander’s printed name (e.g., `Avatar Aang`).
+- `bracket` (optional): defaults to `all`. Accepts human names or numeric aliases (1=exhibition, 2=core, 3=upgraded, 4=optimized, 5=cedh).
+
+**Response Shape**
+
+- `header`: "{Commander} -- Average Deck ({BracketLabel})"
+- `source_url`: EDHREC page used to build the list.
+- `container.collections[0].items`: normalized `{count, name}` deck entries.
+
+**JIT Tool (for GPT)**
+
+- Tool: `edhrec_average_deck`
+- Params: `{ name, bracket? }`
 
 ## EDHREC Themes via Mightstone
 

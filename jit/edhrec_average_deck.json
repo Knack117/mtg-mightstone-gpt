@@ -1,0 +1,20 @@
+{
+  "name": "edhrec_average_deck",
+  "description": "Fetch EDHREC Average Deck for a commander (all/exhibition/core/upgraded/optimized/cedh).",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Commander name"
+      },
+      "bracket": {
+        "type": "string",
+        "enum": ["all", "exhibition", "core", "upgraded", "optimized", "cedh", "1", "2", "3", "4", "5"],
+        "default": "all"
+      }
+    },
+    "required": ["name"]
+  },
+  "route": "/edhrec/average_deck"
+}

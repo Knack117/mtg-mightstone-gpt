@@ -3,3 +3,5 @@ uvicorn[standard]
 mightstone
 httpx
 hishel
+requests
+beautifulsoup4

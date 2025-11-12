@@ -15,6 +15,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from utils.commander_identity import normalize_commander_name
+from utils.edhrec_average import fetch_average_deck
 from utils.identity import canonicalize_identity
 
 # -----------------------------------------------------------------------------
@@ -693,6 +694,22 @@ async def hydrate_items(
 @app.get("/privacy", response_class=HTMLResponse)
 def privacy():
     return HTMLResponse(content=PRIVACY_HTML, media_type="text/html; charset=utf-8")
+
+
+@app.get("/edhrec/average_deck")
+def edhrec_average_deck(
+    name: str = Query(..., description="Commander name (printed name)"),
+    bracket: str = Query(
+        "all",
+        description="Average deck bracket (all|exhibition|core|upgraded|optimized|cedh|1..5)",
+    ),
+):
+    try:
+        return fetch_average_deck(name=name, bracket=bracket)
+    except HTTPException:
+        raise
+    except Exception as exc:  # pragma: no cover - safeguard
+        raise HTTPException(status_code=502, detail=f"Failed to fetch average deck: {exc}") from exc
 
 
 @app.get("/health", response_model=HealthResponse)
