@@ -5,13 +5,14 @@ import logging
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from utils.commander_identity import normalize_commander_name
 from utils.identity import canonicalize_identity
 
 # -----------------------------------------------------------------------------
@@ -57,6 +58,7 @@ class PageTheme(BaseModel):
     description: str
     container: ThemeContainer
     source_url: Optional[str] = None
+    error: Optional[str] = None
 
 class HealthResponse(BaseModel):
     status: str
@@ -105,6 +107,34 @@ async def on_shutdown():
 # Helpers: EDHREC (Next.js) tag/theme scraping via JSON
 # -----------------------------------------------------------------------------
 _build_id_rx = re.compile(r'"buildId"\s*:\s*"([^"]+)"')
+
+
+def _camel_or_snake_to_title(value: str) -> str:
+    value = value or ""
+    normalized = re.sub(r"[^a-z0-9]", "", value.lower())
+    header_aliases = {
+        "signaturecards": "Signature Cards",
+        "popularcards": "Top Cards",
+        "topcards": "Top Cards",
+        "highsynergycards": "High Synergy Cards",
+        "synergycards": "High Synergy Cards",
+        "newcards": "New Cards",
+        "newcommanders": "New Commanders",
+        "topcommanders": "Top Commanders",
+        "toppartners": "Top Partners",
+        "combocards": "Combo Cards",
+        "combos": "Combos",
+        "cardviews": "Cardviews",
+        "cards": "Cards",
+    }
+    if normalized in header_aliases:
+        return header_aliases[normalized]
+
+    spaced = re.sub(r"[_\-]+", " ", value)
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", spaced)
+    spaced = re.sub(r"(?i)(cards)$", " Cards", spaced)
+    spaced = re.sub(r"\s+", " ", spaced).strip()
+    return spaced.title() if spaced else "Cards"
 
 async def _fetch_text(url: str) -> str:
     log.info('HTTP GET %s', url)
@@ -186,6 +216,251 @@ def _walk_for_named_arrays(obj: Any) -> Dict[str, List[str]]:
                 seen.add(n)
         buckets[k] = uniq
     return buckets
+
+
+def _commander_item_from_entry(entry: Any) -> Optional[ThemeItem]:
+    if not isinstance(entry, dict):
+        return None
+
+    name: Optional[str] = None
+    scryfall_id: Optional[str] = None
+    image_url: Optional[str] = None
+
+    card = entry.get("card")
+    if isinstance(card, dict):
+        name = card.get("name") or card.get("label")
+        scryfall_id = card.get("scryfall_id") or card.get("scryfallId") or card.get("id")
+        image_field = card.get("image") or card.get("image_url") or card.get("imageUri")
+        if isinstance(image_field, str):
+            image_url = image_field
+        elif isinstance(image_field, dict):
+            image_url = image_field.get("normal") or image_field.get("large") or image_field.get("art")
+        elif isinstance(card.get("image_uris"), dict):
+            image_uris = card.get("image_uris")
+            image_url = image_uris.get("normal") or image_uris.get("large")
+
+    if not name:
+        name = entry.get("name") or entry.get("label")
+    if not name:
+        return None
+
+    item = ThemeItem(name=name)
+    scryfall_id = scryfall_id or entry.get("scryfall_id") or entry.get("scryfallId")
+    if isinstance(scryfall_id, str) and scryfall_id:
+        item.id = scryfall_id
+
+    if not image_url:
+        image_field = entry.get("image") or entry.get("image_url") or entry.get("imageUri")
+        if isinstance(image_field, str):
+            image_url = image_field
+        elif isinstance(image_field, dict):
+            image_url = image_field.get("normal") or image_field.get("large")
+        elif isinstance(entry.get("image_uris"), dict):
+            image_uris = entry.get("image_uris")
+            image_url = image_uris.get("normal") or image_uris.get("large")
+
+    if isinstance(image_url, str) and image_url:
+        item.image = image_url
+
+    return item
+
+
+def _extract_commander_buckets(data: Any) -> Dict[str, List[ThemeItem]]:
+    buckets: Dict[str, List[ThemeItem]] = {}
+    visited_lists: Set[int] = set()
+
+    def walk(node: Any, path: List[str]):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                walk(value, path + [key])
+            return
+
+        if isinstance(node, list):
+            node_id = id(node)
+            if node_id in visited_lists:
+                return
+            visited_lists.add(node_id)
+
+            items: List[ThemeItem] = []
+            for element in node:
+                item = _commander_item_from_entry(element)
+                if item:
+                    items.append(item)
+
+            if items:
+                key = path[-1] if path else "cards"
+                header = _camel_or_snake_to_title(key)
+                existing = buckets.setdefault(header, [])
+                existing_names = {it.name for it in existing}
+                for item in items:
+                    if item.name not in existing_names:
+                        existing.append(item)
+                        existing_names.add(item.name)
+
+            for element in node:
+                walk(element, path)
+
+    if isinstance(data, dict):
+        page_props = data.get("pageProps")
+        if isinstance(page_props, dict) and "data" in page_props:
+            walk(page_props.get("data"), [])
+        else:
+            walk(data, [])
+    else:
+        walk(data, [])
+
+    return buckets
+
+
+def _order_commander_headers(keys: List[str]) -> List[str]:
+    preferred = [
+        "Signature Cards",
+        "High Synergy Cards",
+        "Top Cards",
+        "New Cards",
+        "Top Partners",
+        "Top Commanders",
+        "New Commanders",
+        "Combo Cards",
+        "Combos",
+    ]
+    ordered: List[str] = []
+    seen: Set[str] = set()
+    for name in preferred:
+        if name in keys and name not in seen:
+            ordered.append(name)
+            seen.add(name)
+    for key in keys:
+        if key not in seen:
+            ordered.append(key)
+            seen.add(key)
+    return ordered
+
+
+def _payload_has_collections(payload: Optional[Dict[str, Any]]) -> bool:
+    if not payload:
+        return False
+    container = payload.get("container") if isinstance(payload, dict) else None
+    if isinstance(container, ThemeContainer):
+        collections = container.collections
+    elif isinstance(container, dict):
+        collections = container.get("collections")
+    else:
+        return False
+
+    if not isinstance(collections, list):
+        return False
+
+    for collection in collections:
+        if isinstance(collection, ThemeCollection):
+            if collection.items:
+                return True
+        elif isinstance(collection, dict):
+            items = collection.get("items")
+            if isinstance(items, list) and items:
+                return True
+    return False
+
+
+async def try_fetch_commander_synergy(slug: str) -> Optional[Dict[str, Any]]:
+    commander_url = f"{EDHREC_BASE}/commanders/{slug}"
+    try:
+        html = await _fetch_text(commander_url)
+    except HTTPException:
+        log.warning("Commander HTML fetch failed for slug %s", slug, exc_info=True)
+        return None
+
+    header, description = _extract_title_description_from_head(html)
+    build_id = _extract_build_id_from_html(html)
+    json_payload: Optional[Dict[str, Any]] = None
+
+    if build_id:
+        json_url = f"{EDHREC_BASE}/_next/data/{build_id}/commanders/{slug}.json"
+        try:
+            json_payload = await _fetch_json(json_url)
+        except HTTPException:
+            log.warning("Commander JSON fetch failed for slug %s", slug, exc_info=True)
+            json_payload = None
+    else:
+        log.warning("No buildId discovered for commander slug %s", slug)
+
+    buckets = _extract_commander_buckets(json_payload or {})
+    ordered_headers = _order_commander_headers(list(buckets.keys()))
+    collections: List[ThemeCollection] = []
+    for header_name in ordered_headers:
+        items = buckets.get(header_name, [])
+        if items:
+            collections.append(ThemeCollection(header=header_name, items=items))
+
+    page = PageTheme(
+        header=header or f"{slug.replace('-', ' ').title()} | EDHREC",
+        description=description or "",
+        container=ThemeContainer(collections=collections),
+        source_url=commander_url,
+    )
+    return page.dict()
+
+
+async def http_get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    try:
+        response = await app.state.client.get(url, params=params, follow_redirects=True)
+    except Exception:
+        log.warning("HTTP JSON fetch failed for %s", url, exc_info=True)
+        return None
+
+    if response.status_code != 200:
+        log.warning("HTTP JSON fetch %s returned status %s", url, response.status_code)
+        return None
+
+    try:
+        return response.json()
+    except json.JSONDecodeError:
+        log.warning("Invalid JSON payload from %s", url, exc_info=True)
+    except ValueError:
+        log.warning("Invalid JSON payload from %s", url, exc_info=True)
+    return None
+
+
+async def commander_summary_handler(name: str) -> Dict[str, Any]:
+    display, slug, edhrec_url = normalize_commander_name(name)
+
+    data = await try_fetch_commander_synergy(slug=slug)
+
+    if not _payload_has_collections(data):
+        data = await http_get_json(
+            "https://mtg-mightstone-gpt.onrender.com/commander/summary",
+            params={"name": display},
+        )
+
+    if not _payload_has_collections(data):
+        fallback_page = PageTheme(
+            header=f"{display} | EDHREC",
+            description="",
+            container=ThemeContainer(collections=[]),
+            source_url=edhrec_url,
+            error=f"Synergy unavailable for {display}",
+        )
+        return fallback_page.dict()
+
+    if isinstance(data, dict):
+        data.setdefault("header", f"{display} | EDHREC")
+        data.setdefault("description", "")
+        container = data.get("container")
+        if isinstance(container, ThemeContainer):
+            data["container"] = container.dict()
+        elif not isinstance(container, dict):
+            data["container"] = {"collections": []}
+        data.setdefault("source_url", edhrec_url)
+        return data
+
+    # Final guard: coerce to PageTheme structure
+    page = PageTheme(
+        header=f"{display} | EDHREC",
+        description="",
+        container=ThemeContainer(collections=[]),
+        source_url=edhrec_url,
+    )
+    return page.dict()
 
 async def fetch_theme_tag(name: str, identity: str) -> PageTheme:
     """
@@ -352,6 +627,22 @@ async def hydrate_items(
 @app.get("/health", response_model=HealthResponse)
 async def health():
     return HealthResponse(status="ok")
+
+
+@app.get("/commander/summary", response_model=PageTheme)
+async def commander_summary(
+    name: str = Query(..., description="Commander name (raw string, partners, MDFCs supported)"),
+):
+    try:
+        payload = await commander_summary_handler(name)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.exception("Commander summary fetch failed.")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return PageTheme.parse_obj(payload)
+
 
 @app.get("/edhrec/theme", response_model=PageTheme)
 async def edhrec_theme(
