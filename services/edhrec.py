@@ -7,11 +7,14 @@ import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from functools import wraps
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+from edhrec import _slugify as _discover_slugify
+from edhrec import find_average_deck_url
 
 __all__ = [
     "EdhrecError",
@@ -65,23 +68,9 @@ class EdhrecParsingError(EdhrecError):
 
 
 def slugify_commander(name: str) -> str:
-    """Return the EDHREC slug for a commander name.
+    """Return the EDHREC slug for a commander name."""
 
-    Rules:
-    * Lowercase and trim surrounding whitespace.
-    * Replace " // " and "//" with a hyphen.
-    * Replace all non-alphanumeric characters with hyphens.
-    * Collapse runs of hyphens and strip leading/trailing hyphens.
-    """
-
-    slug = (name or "").strip().lower()
-    if not slug:
-        return ""
-
-    slug = slug.replace(" // ", "-").replace("//", "-")
-    slug = re.sub(r"[^a-z0-9]+", "-", slug)
-    slug = re.sub(r"-+", "-", slug).strip("-")
-    return slug
+    return _discover_slugify(name or "")
 
 
 def average_deck_url(name: str, bracket: str = "upgraded") -> str:
@@ -96,29 +85,15 @@ def _cache_key(slug: str, bracket: str) -> Tuple[str, str]:
     return slug, (bracket or "upgraded").strip().lower()
 
 
-def _with_cache(func):
-    @wraps(func)
-    def wrapper(slug: str, bracket: str, *args: Any, **kwargs: Any):
-        key = _cache_key(slug, bracket)
-        now = time.time()
-        cached = _CACHE.get(key)
-        if cached and now - cached[0] < CACHE_TTL_SECONDS:
-            # Return a shallow copy to avoid callers mutating the cache payload.
-            return json.loads(json.dumps(cached[1]))
-
-        result = func(slug, bracket, *args, **kwargs)
-        _CACHE[key] = (now, json.loads(json.dumps(result)))
-        return result
-
-    return wrapper
-
-
-def _request_average_deck(url: str) -> str:
+def _request_average_deck(url: str, session: Optional[requests.Session] = None) -> str:
     last_exc: Optional[EdhrecError] = None
 
     for attempt in range(RETRY_ATTEMPTS + 1):
         try:
-            response = requests.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+            if session is not None:
+                response = session.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+            else:
+                response = requests.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
         except requests.Timeout as exc:  # pragma: no cover - network failure path
             last_exc = EdhrecTimeoutError(
                 f"Timeout fetching EDHREC page after {REQUEST_TIMEOUT}s", url
@@ -142,6 +117,72 @@ def _request_average_deck(url: str) -> str:
 
     assert last_exc is not None
     raise last_exc
+
+
+_AVERAGE_DECK_PATH_RE = re.compile(r"^/average-decks/([a-z0-9\-]+)/([a-z0-9\-]+)$")
+
+
+def _normalize_average_deck_url(url: str) -> Tuple[str, str, str]:
+    if not url or not str(url).strip():
+        raise ValueError("source_url is required")
+
+    parsed = urlparse(str(url).strip())
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("source_url must be http or https")
+
+    netloc = parsed.netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    if netloc != "edhrec.com":
+        raise ValueError("source_url must point to edhrec.com")
+
+    path = parsed.path.rstrip("/")
+    match = _AVERAGE_DECK_PATH_RE.match(path)
+    if not match:
+        raise ValueError("source_url must be an EDHREC average-decks URL")
+
+    slug, bracket = match.groups()
+    normalized_bracket = bracket.lower()
+    normalized_url = f"https://edhrec.com/average-decks/{slug}/{normalized_bracket}"
+    return normalized_url, slug, normalized_bracket
+
+
+def _fetch_average_deck_payload(
+    slug: str,
+    bracket: str,
+    *,
+    session: Optional[requests.Session] = None,
+    source_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    key = _cache_key(slug, bracket)
+    now = time.time()
+    cached = _CACHE.get(key)
+    if cached and now - cached[0] < CACHE_TTL_SECONDS:
+        return json.loads(json.dumps(cached[1]))
+
+    url = source_url or f"https://edhrec.com/average-decks/{slug}/{(bracket or 'upgraded').strip().lower()}"
+    html = _request_average_deck(url, session=session)
+    payload = _find_next_data(html, url)
+    cards = _find_cards_in_payload(payload, url)
+
+    normalized_cards = [
+        {
+            "name": card.name,
+            "qty": int(card.qty),
+            "is_commander": bool(card.is_commander),
+        }
+        for card in cards
+        if card.qty > 0 and card.name
+    ]
+
+    result = {
+        "source_url": url,
+        "bracket": (bracket or "upgraded").strip().lower(),
+        "cards": normalized_cards,
+    }
+    _CACHE[key] = (now, json.loads(json.dumps(result)))
+    return json.loads(json.dumps(result))
 
 
 def _find_next_data(html: str, url: str) -> Dict[str, Any]:
@@ -311,18 +352,26 @@ def _dedupe_cards(cards: Iterable[_NormalizedCard]) -> List[_NormalizedCard]:
     return list(combined.values())
 
 
-def _extract_commander_card(name: str, cards: List[_NormalizedCard]) -> Tuple[Optional[Dict[str, Any]], List[_NormalizedCard]]:
-    commander_names = [name.strip() for name in re.split(r"//", name)]
+def _extract_commander_card(
+    name: Optional[str], cards: List[_NormalizedCard]
+) -> Tuple[Optional[Dict[str, Any]], List[_NormalizedCard]]:
+    normalized_name = (name or "").strip()
+    commander_names = [part.strip() for part in re.split(r"//", normalized_name)] if normalized_name else []
     commander_names = [n for n in commander_names if n]
     normalized_lookup = {n.lower(): n for n in commander_names}
-    full_name_lower = name.strip().lower()
+    full_name_lower = normalized_name.lower() if normalized_name else None
 
     commander_entries: List[_NormalizedCard] = []
     remaining: List[_NormalizedCard] = []
 
     for card in cards:
         card_name_lower = card.name.lower()
-        if card.is_commander or card_name_lower == full_name_lower or card_name_lower in normalized_lookup:
+        is_match = card.is_commander
+        if full_name_lower and card_name_lower == full_name_lower:
+            is_match = True
+        if normalized_lookup and card_name_lower in normalized_lookup:
+            is_match = True
+        if is_match:
             commander_entries.append(card)
         else:
             remaining.append(card)
@@ -332,8 +381,12 @@ def _extract_commander_card(name: str, cards: List[_NormalizedCard]) -> Tuple[Op
 
     total_qty = sum(card.qty for card in commander_entries)
     component_names = [card.name for card in commander_entries]
-    commander_card: Dict[str, Any] = {"name": name.strip() or commander_entries[0].name, "qty": total_qty}
-    if len(component_names) > 1 or commander_card["name"].lower() != commander_entries[0].name.lower():
+    if normalized_name:
+        commander_name = normalized_name
+    else:
+        commander_name = " // ".join(component_names)
+    commander_card: Dict[str, Any] = {"name": commander_name, "qty": total_qty}
+    if len(component_names) > 1 or commander_name.lower() != commander_entries[0].name.lower():
         commander_card["components"] = component_names
 
     return commander_card, remaining
@@ -367,50 +420,91 @@ def _find_cards_in_payload(data: Dict[str, Any], url: str) -> List[_NormalizedCa
     raise EdhrecParsingError("Could not parse EDHREC average deck", url, f"pageProps keys: {keys}")
 
 
-@_with_cache
-def _fetch_average_deck(slug: str, bracket: str, name: str) -> Dict[str, Any]:
-    url = f"https://edhrec.com/average-decks/{slug}/{(bracket or 'upgraded').strip().lower()}"
-    html = _request_average_deck(url)
-    payload = _find_next_data(html, url)
-    cards = _find_cards_in_payload(payload, url)
+def fetch_average_deck(
+    name: Optional[str] = None,
+    bracket: Optional[str] = "upgraded",
+    *,
+    source_url: Optional[str] = None,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    """Fetch and parse EDHREC average deck data."""
 
-    commander_card, remaining_cards = _extract_commander_card(name, cards)
+    normalized_name = (name or "").strip() or None
+    normalized_bracket = (bracket or "").strip().lower() if bracket else None
+    available_brackets: Optional[Set[str]] = None
+
+    own_session = False
+    if session is None:
+        session = requests.Session()
+        own_session = True
+
+    try:
+        if source_url:
+            normalized_url, slug, normalized_bracket = _normalize_average_deck_url(source_url)
+        else:
+            if not normalized_name:
+                raise ValueError("Commander name is required")
+            if not normalized_bracket:
+                raise ValueError("Bracket must be provided when source_url is omitted")
+
+            discovery = find_average_deck_url(session, normalized_name, normalized_bracket)
+            raw_url = discovery.get("source_url")
+            normalized_url, slug, normalized_bracket = _normalize_average_deck_url(str(raw_url))
+            available_data = discovery.get("available_brackets")
+            if isinstance(available_data, (set, list, tuple)):
+                available_brackets = {str(item) for item in available_data}
+        payload = _fetch_average_deck_payload(
+            slug,
+            normalized_bracket or "upgraded",
+            session=session,
+            source_url=normalized_url,
+        )
+    finally:
+        if own_session:
+            session.close()
+
+    cards_payload = payload.get("cards", [])
+    cards: List[_NormalizedCard] = []
+    for entry in cards_payload:
+        if not isinstance(entry, dict):
+            continue
+        name_value = entry.get("name")
+        qty_value = entry.get("qty")
+        if not isinstance(name_value, str):
+            continue
+        qty_int = _coerce_int(qty_value)
+        if qty_int is None:
+            continue
+        cards.append(
+            _NormalizedCard(
+                name=name_value,
+                qty=max(1, qty_int),
+                is_commander=bool(entry.get("is_commander")),
+            )
+        )
+
+    commander_card, remaining_cards = _extract_commander_card(normalized_name, cards)
     final_cards = [
         {"name": card.name, "qty": card.qty}
         for card in remaining_cards
         if card.qty > 0 and card.name
     ]
 
-    return {
-        "commander": name,
-        "bracket": (bracket or "upgraded").strip().lower(),
-        "source_url": url,
+    if not final_cards:
+        raise EdhrecParsingError("Parsed deck contained no cards", payload.get("source_url", ""), None)
+
+    result: Dict[str, Any] = {
+        "commander": normalized_name or (commander_card["name"] if commander_card else None),
+        "bracket": payload.get("bracket", normalized_bracket or "upgraded"),
+        "source_url": payload.get("source_url"),
         "cards": final_cards,
         "commander_card": commander_card,
     }
 
+    if result["commander"] is None:
+        result.pop("commander")
 
-def fetch_average_deck(name: str, bracket: str = "upgraded") -> Dict[str, Any]:
-    """Fetch and parse EDHREC average deck data for *name*.
+    if available_brackets is not None:
+        result["available_brackets"] = sorted(available_brackets)
 
-    Results are cached for a short period to avoid unnecessary network load.
-    """
-
-    if not name or not name.strip():
-        raise ValueError("Commander name is required")
-
-    slug = slugify_commander(name)
-    if not slug:
-        raise ValueError("Commander name is required")
-
-    normalized_bracket = (bracket or "upgraded").strip().lower()
-    if normalized_bracket not in {"upgraded", "precon"}:
-        raise ValueError("Bracket must be 'upgraded' or 'precon'")
-
-    data = _fetch_average_deck(slug, normalized_bracket, name.strip())
-
-    cards = data.get("cards", [])
-    if not isinstance(cards, list) or not cards:
-        raise EdhrecParsingError("Parsed deck contained no cards", data["source_url"], None)
-
-    return data
+    return result
