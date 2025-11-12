@@ -354,7 +354,7 @@ async def edhrec_theme_hydrated(
 @app.get("/cards/search")
 async def cards_search(
     q: str = Query(..., description="Scryfall query string. Use exact names with !\"Name\" for precision."),
-    limit: int = Query(10, ge=1, le=75)
+    limit: int = Query(10, ge=1, le=175)
 ):
     """
     Light wrapper around Scryfall /cards/search. Useful for client hydration or debugging.
