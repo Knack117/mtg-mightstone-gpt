@@ -10,6 +10,7 @@
       },
       "bracket": {
         "type": "string",
+        "description": "Bracket (name or 1..5)",
         "enum": ["all", "exhibition", "core", "upgraded", "optimized", "cedh", "1", "2", "3", "4", "5"],
         "default": "all"
       }
