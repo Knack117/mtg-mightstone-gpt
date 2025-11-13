@@ -1,0 +1,201 @@
+import json
+
+import pytest
+
+from services import edhrec
+
+
+class DummyResponse:
+    def __init__(self, text: str, status_code: int = 200):
+        self.text = text
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise Exception(f"HTTP {self.status_code}")
+
+    def json(self):
+        return json.loads(self.text)
+
+
+class DummySession:
+    def __init__(self, responses):
+        self._responses = responses
+        self.requested = []
+
+    def get(self, url, headers=None, timeout=None):
+        self.requested.append(url)
+        response = self._responses.get(url)
+        if response is None:
+            raise AssertionError(f"Unexpected URL {url}")
+        return response
+
+    def close(self):
+        pass
+
+
+def _build_commander_html_payload():
+    next_data = {
+        "props": {
+            "pageProps": {
+                "commander": {
+                    "metadata": {
+                        "tagCloud": {
+                            "groups": [
+                                {
+                                    "tags": [
+                                        {
+                                            "name": "Proliferate",
+                                            "deckCount": 1234,
+                                            "slug": "/tags/proliferate",
+                                        },
+                                        {
+                                            "tag": {"name": "Angels"},
+                                            "deckCount": 987,
+                                            "url": "/tags/angels",
+                                        },
+                                    ]
+                                }
+                            ]
+                        }
+                    },
+                    "themes": [
+                        {"name": "Proliferate"},
+                        {"name": "Angels"},
+                    ],
+                },
+                "data": {
+                    "container": {
+                        "json_dict": {
+                            "cardlists": [
+                                {
+                                    "header": "High Synergy Cards",
+                                    "cards": [
+                                        {
+                                            "name": "Evolution Sage",
+                                            "synergy": 0.32,
+                                            "num_decks": 120,
+                                            "potential_decks": 300,
+                                        },
+                                        {
+                                            "name": "Sol Ring",
+                                            "synergy": 0.05,
+                                            "num_decks": 280,
+                                            "potential_decks": 300,
+                                        },
+                                    ],
+                                },
+                                {
+                                    "header": "Creatures",
+                                    "cards": [
+                                        {
+                                            "name": "Atraxa, Praetors' Voice",
+                                            "num_decks": 150,
+                                            "potential_decks": 300,
+                                        }
+                                    ],
+                                },
+                            ]
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    html = f"""
+    <html>
+      <head>
+        <title>Atraxa Summary</title>
+        <meta name=\"description\" content=\"Test commander summary\" />
+      </head>
+      <body>
+        <h2>Tags</h2>
+        <a href=\"/tags/proliferate\" data-tag-count=\"1234\">Proliferate (1,234)</a>
+        <a href=\"/tags/angels\"><span>Angels</span><span>987 decks</span></a>
+        <script id=\"__NEXT_DATA__\" type=\"application/json\">{json.dumps(next_data)}</script>
+      </body>
+    </html>
+    """
+    return html
+
+
+def test_fetch_commander_summary_parses_sections_and_tags():
+    name = "Atraxa, Praetors' Voice"
+    slug = "atraxa-praetors-voice"
+    url = f"https://edhrec.com/commanders/{slug}"
+    html = _build_commander_html_payload()
+    session = DummySession({url: DummyResponse(html)})
+
+    summary = edhrec.fetch_commander_summary(name, session=session)
+
+    assert summary["slug"] == slug
+    assert summary["budget"] is None
+    assert summary["source_url"] == url
+
+    categories = summary["categories"]
+    assert "High Synergy Cards" in categories
+    synergy_cards = categories["High Synergy Cards"]
+    assert synergy_cards[0]["name"] == "Evolution Sage"
+    assert synergy_cards[0]["synergy_percent"] == 32.0
+    assert synergy_cards[0]["inclusion_percent"] == 40.0
+
+    assert categories["Creatures"][0]["name"] == "Atraxa, Praetors' Voice"
+    assert isinstance(summary["tags"], list)
+    assert {tag["name"] for tag in summary["tags"]} >= {"Proliferate", "Angels"}
+    assert summary["top_tags"][0]["name"] == "Proliferate"
+
+
+def test_fetch_commander_summary_budget_validation():
+    with pytest.raises(ValueError):
+        edhrec.fetch_commander_summary("Atraxa, Praetors' Voice", budget="invalid", session=DummySession({}))
+
+
+def test_fetch_commander_tag_theme_returns_cards():
+    name = "Atraxa, Praetors' Voice"
+    slug = "atraxa-praetors-voice"
+    tag_slug = "proliferate"
+    url = f"https://edhrec.com/commanders/{slug}/{tag_slug}"
+    html = _build_commander_html_payload()
+    session = DummySession({url: DummyResponse(html)})
+
+    data = edhrec.fetch_commander_tag_theme(name, tag_slug, session=session)
+
+    assert data["tag"] == tag_slug
+    assert data["categories"]["High Synergy Cards"]
+    assert data["header"].startswith(name.split(",")[0])
+
+
+def test_fetch_tag_theme_for_identity():
+    tag_slug = "plus-1-plus-1-counters"
+    identity = "mono-green"
+    url = f"https://edhrec.com/tags/{tag_slug}/{identity}"
+    html = _build_commander_html_payload()
+    session = DummySession({url: DummyResponse(html)})
+
+    data = edhrec.fetch_tag_theme(tag_slug, identity=identity, session=session)
+
+    assert data["tag"] == tag_slug
+    assert data["identity"] == identity
+    assert "High Synergy Cards" in data["categories"]
+
+
+def test_fetch_tag_index_parses_anchor_lists():
+    html = """
+    <html>
+      <body>
+        <a href=\"/tags/proliferate\" data-tag-count=\"1234\">Proliferate (1,234)</a>
+        <a href=\"/tags/angels/mono-white\">Angels 567 decks</a>
+      </body>
+    </html>
+    """
+    url = "https://edhrec.com/tags"
+    session = DummySession({url: DummyResponse(html)})
+
+    index = edhrec.fetch_tag_index(session=session)
+
+    assert index["source_url"] == url
+    entries = {entry["slug"]: entry for entry in index["tags"]}
+    assert "proliferate" in entries
+    assert entries["proliferate"]["deck_count"] == 1234
+    assert entries["angels"]["identity"] == "mono-white"

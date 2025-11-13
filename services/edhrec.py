@@ -37,6 +37,9 @@ __all__ = [
     "fetch_average_deck",
     "slugify_commander",
     "fetch_commander_summary",
+    "fetch_commander_tag_theme",
+    "fetch_tag_theme",
+    "fetch_tag_index",
 ]
 
 USER_AGENT = "Mightstone-GPT/1.0 (+https://mtg-mightstone-gpt.onrender.com)"
@@ -634,97 +637,345 @@ def fetch_average_deck(
 # Commander Summary Helpers
 #
 # These helper functions fetch and parse commander pages on EDHREC, including
-# budget variants, and extract card categories, inclusion percentages, synergy
-# percentages, and tag counts. They leverage the Next.js JSON payloads that
-# EDHREC embeds in its pages and compute percentages client-side.
+# budget variants, extract card categories, compute inclusion percentages, and
+# collect tag counts from both the HTML and embedded Next.js payloads.
 # -----------------------------------------------------------------------------
 
-def _parse_count(value: str) -> Optional[int]:
-    """Parse strings like '7.6K', '900', '3M' into integers."""
-    if not value:
+_SUMMARY_SECTION_ORDER: Tuple[str, ...] = (
+    "New Cards",
+    "High Synergy Cards",
+    "Top Cards",
+    "Game Changers",
+    "Creatures",
+    "Instants",
+    "Sorceries",
+    "Utility Artifacts",
+    "Enchantments",
+    "Battles",
+    "Planeswalkers",
+    "Utility Lands",
+    "Mana Artifacts",
+    "Lands",
+)
+
+_TAG_LINK_RE = re.compile(r"/(?:tags|themes)/[a-z0-9\-]+(?:/[a-z0-9\-]+)?", re.IGNORECASE)
+
+
+def _coerce_budget_segment(budget: Optional[str]) -> Optional[str]:
+    if budget is None:
         return None
-    v = value.lower().replace(",", "")
-    mult = 1
-    if v.endswith("k"):
-        mult, v = 1000, v[:-1]
-    elif v.endswith("m"):
-        mult, v = 1_000_000, v[:-1]
+    normalized = budget.strip().lower()
+    if not normalized:
+        return None
+    aliases = {
+        "budget": "budget",
+        "cheap": "budget",
+        "low": "budget",
+        "expensive": "expensive",
+        "premium": "expensive",
+        "high": "expensive",
+    }
+    resolved = aliases.get(normalized, normalized)
+    if resolved not in {"budget", "expensive"}:
+        raise ValueError("Budget must be 'budget' or 'expensive'")
+    return resolved
+
+
+def _parse_count(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    text = text.replace(",", "")
+    multiplier = 1
+    if text.endswith("k"):
+        multiplier, text = 1000, text[:-1]
+    elif text.endswith("m"):
+        multiplier, text = 1_000_000, text[:-1]
     try:
-        return int(float(v) * mult)
+        return int(float(text) * multiplier)
     except ValueError:
         return None
 
 
-def _extract_tags_with_counts(html: str) -> List[Dict[str, Any]]:
-    """Extract tag names and deck counts from a commander page's HTML."""
-    tags: List[Dict[str, Any]] = []
+def _split_tag_name_and_count(text: str) -> Tuple[str, Optional[int]]:
+    cleaned = text.strip()
+    if not cleaned:
+        return "", None
+    match = re.search(r"\(([^)]+)\)\s*$", cleaned)
+    if match:
+        count = _parse_count(match.group(1))
+        name = cleaned[: match.start()].strip()
+        return name, count
+    match = re.search(r"([0-9][0-9,\.]*\s*[kKmM]?)(?:\s+decks?|$)", cleaned)
+    if match and match.end() == len(cleaned):
+        count = _parse_count(match.group(1))
+        name = cleaned[: match.start()].strip(" -:\u2013")
+        return name, count
+    return cleaned, None
+
+
+def _extract_tags_with_counts_from_html(html: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
+    merged: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+
+    def record(name: str, count: Optional[int]) -> None:
+        normalized = name.strip()
+        if not normalized:
+            return
+        key = normalized.lower()
+        if key in merged:
+            if merged[key]["deck_count"] is None and isinstance(count, int):
+                merged[key]["deck_count"] = count
+            return
+        merged[key] = {"name": normalized, "deck_count": count if isinstance(count, int) else None}
+
     for anchor in soup.find_all("a", href=True):
-        href = anchor.get("href", "").lower()
-        if "/tags/" not in href and "/themes/" not in href:
+        href = anchor.get("href", "")
+        if not _TAG_LINK_RE.search(href or ""):
             continue
-        text = anchor.get_text(" ").strip()
-        if not text:
-            continue
-        parts = text.split()
         count: Optional[int] = None
-        if parts and re.match(r"^[\d.].*", parts[-1]):
-            count = _parse_count(parts[-1])
-            name = " ".join(parts[:-1]) if len(parts) > 1 else parts[-1]
-        else:
-            name = text
-        # ensure no duplicates by name (case-insensitive)
-        if name and not any(t["name"].lower() == name.lower() for t in tags):
-            tags.append({"name": name, "deck_count": count})
-    return tags
+        for attr in ("data-tag-count", "data-count", "data-deck-count"):
+            if attr in anchor.attrs:
+                count = _parse_count(anchor.attrs.get(attr))
+                if count is not None:
+                    break
+        if count is None:
+            for child in anchor.find_all(["span", "div"]):
+                child_text = child.get_text(" ", strip=True)
+                _, child_count = _split_tag_name_and_count(child_text)
+                if child_count is not None:
+                    count = child_count
+                    break
+        text = anchor.get_text(" ", strip=True)
+        name, parsed_count = _split_tag_name_and_count(text)
+        if count is None:
+            count = parsed_count
+        record(name, count)
+
+    return list(merged.values())
 
 
-def _parse_cardlists_from_json(payload: dict) -> Dict[str, List[Dict[str, Any]]]:
-    """Parse card lists and compute inclusion & synergy percentages from EDHREC JSON."""
-    categories: Dict[str, List[Dict[str, Any]]] = {}
-    page_props = payload.get("props", {}).get("pageProps", {})
-    cardlists = page_props.get("data", {}).get("container", {}).get("json_dict", {}).get("cardlists")
-    if not cardlists:
-        return categories
-    for section in cardlists:
-        header = section.get("header") or section.get("name") or section.get("title")
-        if not isinstance(header, str):
+def _extract_tags_with_counts_from_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    commander = (
+        payload.get("props", {})
+        .get("pageProps", {})
+        .get("commander")
+    )
+    if not isinstance(commander, dict):
+        return []
+
+    merged: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+
+    def record(name: str, count: Optional[int]) -> None:
+        normalized = (name or "").strip()
+        if not normalized:
+            return
+        key = normalized.lower()
+        if key in merged:
+            if merged[key]["deck_count"] is None and isinstance(count, int):
+                merged[key]["deck_count"] = count
+            return
+        merged[key] = {"name": normalized, "deck_count": count if isinstance(count, int) else None}
+
+    visited: Set[int] = set()
+
+    def walk(node: Any, *, is_tag_context: bool = False) -> None:
+        node_id = id(node)
+        if node_id in visited:
+            return
+        visited.add(node_id)
+
+        if isinstance(node, dict):
+            slug_value = None
+            for key in ("slug", "href", "url", "path"):
+                raw = node.get(key)
+                if isinstance(raw, str) and _TAG_LINK_RE.search(raw):
+                    slug_value = raw
+                    break
+            tag_field = node.get("tag") or node.get("theme")
+            name_field: Optional[str] = None
+            for key in ("name", "label", "title", "displayName"):
+                raw = node.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    name_field = raw.strip()
+                    break
+            if name_field is None and isinstance(tag_field, dict):
+                for key in ("name", "label", "title"):
+                    raw = tag_field.get(key)
+                    if isinstance(raw, str) and raw.strip():
+                        name_field = raw.strip()
+                        break
+            elif name_field is None and isinstance(tag_field, str):
+                name_field = tag_field.strip()
+
+            count_value: Optional[int] = None
+            for key in ("deckCount", "deck_count", "numDecks", "num_decks", "count", "decks"):
+                count_value = _parse_count(node.get(key))
+                if count_value is not None:
+                    break
+
+            is_tag = is_tag_context or slug_value is not None or tag_field is not None
+
+            if name_field and count_value is not None and is_tag:
+                record(name_field, count_value)
+
+            for child_key, child_value in node.items():
+                if isinstance(child_value, (dict, list, tuple, set)):
+                    child_tag_context = is_tag or child_key.lower() in {
+                        "tags",
+                        "themes",
+                        "tagcloud",
+                        "tag_cloud",
+                        "taggroups",
+                        "groups",
+                    }
+                    walk(child_value, is_tag_context=child_tag_context)
+
+        elif isinstance(node, (list, tuple, set)):
+            for entry in node:
+                if isinstance(entry, (dict, list, tuple, set)):
+                    walk(entry, is_tag_context=is_tag_context)
+
+    walk(commander)
+    return list(merged.values())
+
+
+def _merge_tag_sources(*sources: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+    for source in sources:
+        if not source:
             continue
-        header = header.strip()
+        for entry in source:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            key = name.strip().lower()
+            count = entry.get("deck_count")
+            count_value = int(count) if isinstance(count, (int, float)) else None
+            if key in merged:
+                if merged[key]["deck_count"] is None and count_value is not None:
+                    merged[key]["deck_count"] = count_value
+            else:
+                merged[key] = {"name": name.strip(), "deck_count": count_value}
+    return list(merged.values())
+
+
+def _sort_tags_by_deck_count(tags: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def sort_key(entry: Dict[str, Any]) -> Tuple[float, str]:
+        count = entry.get("deck_count")
+        if isinstance(count, int):
+            return (-float(count), entry["name"].lower())
+        return (float("inf"), entry["name"].lower())
+
+    return sorted(tags, key=sort_key)
+
+
+def _parse_cardlists_from_json(payload: Optional[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    categories: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
+    if not isinstance(payload, dict):
+        return {}
+    page_props = payload.get("props", {}).get("pageProps", {})
+    container = page_props.get("data", {}).get("container", {})
+    json_dict = container.get("json_dict") or container.get("jsonDict") or {}
+    cardlists = json_dict.get("cardlists")
+    if not isinstance(cardlists, list):
+        return {}
+
+    for section in cardlists:
+        if not isinstance(section, dict):
+            continue
+        header = section.get("header") or section.get("name") or section.get("title")
+        if not isinstance(header, str) or not header.strip():
+            continue
+        header_text = header.strip()
         cards_out: List[Dict[str, Any]] = []
         for key in ("cardviews", "cards", "items"):
-            cardlist = section.get(key)
-            if isinstance(cardlist, list):
-                for entry in cardlist:
-                    name = entry.get("name") or entry.get("cardName") or entry.get("label")
-                    if not name:
-                        continue
-                    name = name.strip()
-                    synergy = entry.get("synergy")
-                    synergy_pct = (
-                        round(float(synergy) * 100, 2)
-                        if isinstance(synergy, (int, float))
-                        else None
-                    )
-                    num_decks = entry.get("num_decks") or entry.get("numDecks") or entry.get("inclusion")
-                    potential_decks = entry.get("potential_decks") or entry.get("potentialDecks")
-                    inclusion_pct: Optional[float] = None
-                    if (
-                        isinstance(num_decks, (int, float))
-                        and isinstance(potential_decks, (int, float))
-                        and potential_decks
-                    ):
+            card_entries = section.get(key)
+            if not isinstance(card_entries, list):
+                continue
+            for entry in card_entries:
+                if not isinstance(entry, dict):
+                    continue
+                name = None
+                for name_key in ("name", "cardName", "label", "title"):
+                    raw = entry.get(name_key)
+                    if isinstance(raw, str) and raw.strip():
+                        name = raw.strip()
+                        break
+                if name is None and isinstance(entry.get("names"), list):
+                    parts = [str(part).strip() for part in entry["names"] if isinstance(part, str) and part.strip()]
+                    if parts:
+                        name = " // ".join(parts)
+                if not name:
+                    continue
+                synergy = entry.get("synergy")
+                synergy_pct = (
+                    round(float(synergy) * 100, 2)
+                    if isinstance(synergy, (int, float))
+                    else None
+                )
+                num_decks = entry.get("num_decks") or entry.get("numDecks") or entry.get("inclusion")
+                potential_decks = entry.get("potential_decks") or entry.get("potentialDecks")
+                inclusion_pct: Optional[float] = None
+                if (
+                    isinstance(num_decks, (int, float))
+                    and isinstance(potential_decks, (int, float))
+                    and potential_decks
+                ):
+                    try:
                         inclusion_pct = round(float(num_decks) / float(potential_decks) * 100, 2)
-                    cards_out.append(
-                        {
-                            "name": name,
-                            "inclusion_percent": inclusion_pct,
-                            "synergy_percent": synergy_pct,
-                        }
-                    )
+                    except ZeroDivisionError:
+                        inclusion_pct = None
+                cards_out.append(
+                    {
+                        "name": name,
+                        "inclusion_percent": inclusion_pct,
+                        "synergy_percent": synergy_pct,
+                    }
+                )
         if cards_out:
-            categories[header] = cards_out
-    return categories
+            categories[header_text] = cards_out
+
+    return dict(categories)
+
+
+def _normalize_summary_categories(categories: Dict[str, List[Dict[str, Any]]]) -> Dict[str, List[Dict[str, Any]]]:
+    ordered: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
+    for header in _SUMMARY_SECTION_ORDER:
+        ordered[header] = list(categories.get(header, []))
+    for header, cards in categories.items():
+        if header not in ordered:
+            ordered[header] = cards
+    return dict(ordered)
+
+
+def _extract_next_payload(html: str, url: str) -> Optional[Dict[str, Any]]:
+    try:
+        return _find_next_data(html, url)
+    except EdhrecParsingError:
+        return None
+    except Exception:
+        return None
+
+
+def _extract_page_metadata(html: str) -> Tuple[Optional[str], Optional[str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    title_tag = soup.find("title")
+    meta_desc = soup.find("meta", attrs={"name": "description"})
+    title = title_tag.get_text(strip=True) if title_tag else None
+    description = meta_desc.get("content", None) if meta_desc else None
+    if isinstance(description, str):
+        description = description.strip()
+    return title, description
 
 
 def fetch_commander_summary(
@@ -733,54 +984,252 @@ def fetch_commander_summary(
     budget: Optional[str] = None,
     session: Optional[requests.Session] = None,
 ) -> Dict[str, Any]:
-    """Return a detailed summary for a commander, optionally filtered by budget.
-
-    This function fetches the commander page (and budget variant, if provided),
-    extracts tag names with deck counts, fetches the Next.js JSON payload to
-    derive card categories (such as New Cards, High Synergy Cards, etc.) and
-    computes inclusion & synergy percentages for each card. It returns the
-    commander name, source URL, budget, card categories, the full tag list,
-    and the top 10 tags by deck count.
-    """
-    if not name:
+    if not name or not name.strip():
         raise ValueError("Commander name is required")
+
     slug = commander_to_slug(name.strip())
-    own = False
+    budget_segment = _coerce_budget_segment(budget)
+    own_session = False
     if session is None:
         session = requests.Session()
-        own = True
+        own_session = True
+
     try:
         url = f"https://edhrec.com/commanders/{slug}"
-        if budget:
-            budget_slug = budget.strip().lower()
-            url = f"{url}/{budget_slug}"
-        r = session.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        html = r.text
-        tags = _extract_tags_with_counts(html)
-        build_id = extract_build_id_from_html(html)
-        categories: Dict[str, List[Dict[str, Any]]] = {}
-        if build_id:
-            json_url = f"https://edhrec.com/_next/data/{build_id}/commanders/{slug}"
-            if budget:
-                json_url = f"{json_url}/{budget_slug}"
-            json_url += ".json"
-            try:
-                j = session.get(json_url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
-                if j.status_code == 200:
-                    payload = j.json()
-                    categories = _parse_cardlists_from_json(payload)
-            except Exception:
-                pass
-        tags_sorted = sorted(tags, key=lambda t: -(t["deck_count"] or -1))
+        if budget_segment:
+            url = f"{url}/{budget_segment}"
+
+        response = session.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        html = response.text
+
+        payload = _extract_next_payload(html, url)
+        categories = _normalize_summary_categories(_parse_cardlists_from_json(payload))
+
+        tags_from_payload = _extract_tags_with_counts_from_payload(payload or {}) if payload else []
+        tags_from_html = _extract_tags_with_counts_from_html(html)
+
+        json_tag_names = extract_commander_tags_from_json(payload) if payload else []
+        html_tag_names = extract_commander_tags_from_html(html)
+
+        combined_tags = _merge_tag_sources(
+            tags_from_payload,
+            tags_from_html,
+            ({"name": tag, "deck_count": None} for tag in json_tag_names),
+            ({"name": tag, "deck_count": None} for tag in html_tag_names),
+        )
+
+        top_tags = _sort_tags_by_deck_count(combined_tags)[:10]
+
         return {
-            "commander": name,
+            "commander": name.strip(),
+            "slug": slug,
             "source_url": url,
-            "budget": budget or None,
+            "budget": budget_segment,
             "categories": categories,
-            "tags": tags,
-            "top_tags": tags_sorted[:10],
+            "tags": combined_tags,
+            "top_tags": top_tags,
         }
     finally:
-        if own:
+        if own_session:
+            session.close()
+
+
+def _slugify_tag(value: str) -> str:
+    text = (value or "").strip().lower()
+    text = text.replace("+", " plus ")
+    text = re.sub(r"[’'`]+", "", text)
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    if not text:
+        raise ValueError("Tag name is required")
+    return text
+
+
+def _normalize_identity_slug(identity: Optional[str]) -> Optional[str]:
+    if identity is None:
+        return None
+    text = identity.strip().lower()
+    if not text:
+        return None
+    text = text.replace("+", "-")
+    text = re.sub(r"[^a-z0-9-]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    return text or None
+
+
+def fetch_commander_tag_theme(
+    name: str,
+    tag: str,
+    *,
+    budget: Optional[str] = None,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    if not name or not name.strip():
+        raise ValueError("Commander name is required")
+    if not tag or not tag.strip():
+        raise ValueError("Tag name is required")
+
+    slug = commander_to_slug(name.strip())
+    tag_slug = _slugify_tag(tag)
+    budget_segment = _coerce_budget_segment(budget)
+
+    own_session = False
+    if session is None:
+        session = requests.Session()
+        own_session = True
+
+    try:
+        url = f"https://edhrec.com/commanders/{slug}"
+        if budget_segment:
+            url = f"{url}/{budget_segment}"
+        url = f"{url}/{tag_slug}"
+
+        response = session.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+        if response.status_code == 404:
+            raise EdhrecNotFoundError("Commander tag theme not found", url)
+        response.raise_for_status()
+        html = response.text
+
+        payload = _extract_next_payload(html, url)
+        categories = _normalize_summary_categories(_parse_cardlists_from_json(payload))
+        title, description = _extract_page_metadata(html)
+
+        if not title:
+            display_tag = tag_slug.replace("-", " ").title()
+            title = f"{name.strip()} – {display_tag} | EDHREC"
+
+        return {
+            "commander": name.strip(),
+            "slug": slug,
+            "tag": tag_slug,
+            "budget": budget_segment,
+            "source_url": url,
+            "header": title,
+            "description": description or "",
+            "categories": categories,
+        }
+    finally:
+        if own_session:
+            session.close()
+
+
+def fetch_tag_theme(
+    tag: str,
+    *,
+    identity: Optional[str] = None,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    if not tag or not tag.strip():
+        raise ValueError("Tag name is required")
+
+    tag_slug = _slugify_tag(tag)
+    identity_slug = _normalize_identity_slug(identity)
+
+    own_session = False
+    if session is None:
+        session = requests.Session()
+        own_session = True
+
+    try:
+        url = f"https://edhrec.com/tags/{tag_slug}"
+        if identity_slug:
+            url = f"{url}/{identity_slug}"
+
+        response = session.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+        if response.status_code == 404:
+            raise EdhrecNotFoundError("Tag theme not found", url)
+        response.raise_for_status()
+        html = response.text
+
+        payload = _extract_next_payload(html, url)
+        categories = _normalize_summary_categories(_parse_cardlists_from_json(payload))
+        title, description = _extract_page_metadata(html)
+
+        if not title:
+            display_tag = tag_slug.replace("-", " ").title()
+            if identity_slug:
+                display_identity = identity_slug.replace("-", " ").title()
+                title = f"{display_tag} – {display_identity} | EDHREC"
+            else:
+                title = f"{display_tag} | EDHREC"
+
+        return {
+            "tag": tag_slug,
+            "identity": identity_slug,
+            "source_url": url,
+            "header": title,
+            "description": description or "",
+            "categories": categories,
+        }
+    finally:
+        if own_session:
+            session.close()
+
+
+def fetch_tag_index(
+    *,
+    identity: Optional[str] = None,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    identity_slug = _normalize_identity_slug(identity)
+
+    own_session = False
+    if session is None:
+        session = requests.Session()
+        own_session = True
+
+    try:
+        url = "https://edhrec.com/tags"
+        if identity_slug:
+            url = f"{url}/{identity_slug}"
+
+        response = session.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        html = response.text
+
+        soup = BeautifulSoup(html, "html.parser")
+        tags: "OrderedDict[Tuple[str, Optional[str]], Dict[str, Any]]" = OrderedDict()
+
+        for anchor in soup.find_all("a", href=True):
+            href = anchor.get("href", "") or ""
+            match = re.match(r"^/tags/([a-z0-9\-]+)(?:/([a-z0-9\-]+))?", href)
+            if not match:
+                continue
+            tag_slug = match.group(1)
+            anchor_identity = match.group(2) or identity_slug
+            text = anchor.get_text(" ", strip=True)
+            name, count = _split_tag_name_and_count(text)
+            for attr in ("data-tag-count", "data-count", "data-deck-count"):
+                if attr in anchor.attrs:
+                    attr_count = _parse_count(anchor.attrs.get(attr))
+                    if attr_count is not None:
+                        count = attr_count
+                        break
+            key = (tag_slug.lower(), anchor_identity.lower() if anchor_identity else None)
+            tag_url = f"https://edhrec.com/tags/{tag_slug}"
+            if anchor_identity:
+                tag_url = f"{tag_url}/{anchor_identity}"
+            entry = tags.get(key)
+            if entry is None:
+                tags[key] = {
+                    "name": name or tag_slug.replace("-", " ").title(),
+                    "slug": tag_slug,
+                    "identity": anchor_identity,
+                    "url": tag_url,
+                    "deck_count": count if isinstance(count, int) else None,
+                }
+            else:
+                if name and (not entry.get("name") or entry["name"].lower() == entry["slug"].replace("-", " ").lower()):
+                    entry["name"] = name
+                if entry.get("deck_count") is None and isinstance(count, int):
+                    entry["deck_count"] = count
+
+        return {
+            "identity": identity_slug,
+            "source_url": url,
+            "tags": list(tags.values()),
+        }
+    finally:
+        if own_session:
             session.close()

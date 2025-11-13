@@ -14,18 +14,34 @@ from utils.commander_identity import commander_slug_candidates
 UA = "MightstoneBot/1.0 (+https://github.com/Knack117/mtg-mightstone-gpt)"
 
 
-_ALLOWED_AVERAGE_DECK_PATHS: Tuple[str, ...] = (
+_PRIMARY_AVERAGE_DECK_BRACKETS: Tuple[str, ...] = (
     "",
     "exhibition",
-    "exhibition/budget",
-    "exhibition/expensive",
     "core",
     "upgraded",
     "optimized",
     "cedh",
-    "cedh/budget",
-    "cedh/expensive",
 )
+
+_BUDGET_SEGMENTS: Tuple[str, ...] = ("budget", "expensive")
+
+
+def _build_allowed_average_deck_paths() -> Tuple[str, ...]:
+    paths: list[str] = []
+    for bracket in _PRIMARY_AVERAGE_DECK_BRACKETS:
+        if bracket not in paths:
+            paths.append(bracket)
+        for segment in _BUDGET_SEGMENTS:
+            if bracket:
+                combo = f"{bracket}/{segment}"
+            else:
+                combo = segment
+            if combo not in paths:
+                paths.append(combo)
+    return tuple(paths)
+
+
+_ALLOWED_AVERAGE_DECK_PATHS: Tuple[str, ...] = _build_allowed_average_deck_paths()
 
 _AVERAGE_DECK_BRACKET_ALIASES = {
     "": "",
@@ -43,10 +59,24 @@ _AVERAGE_DECK_BRACKET_ALIASES = {
     "3": "upgraded",
     "4": "optimized",
     "5": "cedh",
+    "budget": "budget",
+    "expensive": "expensive",
     "exhibition/budget": "exhibition/budget",
     "exhibition-budget": "exhibition/budget",
     "exhibition/expensive": "exhibition/expensive",
     "exhibition-expensive": "exhibition/expensive",
+    "core/budget": "core/budget",
+    "core-budget": "core/budget",
+    "core/expensive": "core/expensive",
+    "core-expensive": "core/expensive",
+    "upgraded/budget": "upgraded/budget",
+    "upgraded-budget": "upgraded/budget",
+    "upgraded/expensive": "upgraded/expensive",
+    "upgraded-expensive": "upgraded/expensive",
+    "optimized/budget": "optimized/budget",
+    "optimized-budget": "optimized/budget",
+    "optimized/expensive": "optimized/expensive",
+    "optimized-expensive": "optimized/expensive",
     "cedh/budget": "cedh/budget",
     "cedh-budget": "cedh/budget",
     "cedh/expensive": "cedh/expensive",
