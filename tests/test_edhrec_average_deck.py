@@ -40,6 +40,7 @@ def test_slugify_commander(name, expected):
         ("Jodah, the Unifier", "upgraded", "https://edhrec.com/average-decks/jodah-the-unifier/upgraded"),
         ("Donatello, the Brains // Michelangelo, the Heart", "exhibition", "https://edhrec.com/average-decks/donatello-the-brains-michelangelo-the-heart/exhibition"),
         ("Donatello, the Brains // Michelangelo, the Heart", "all", "https://edhrec.com/average-decks/donatello-the-brains-michelangelo-the-heart"),
+        ("Atraxa, Praetors' Voice", "exhibitition", "https://edhrec.com/average-decks/atraxa-praetors-voice/exhibition"),
     ],
 )
 def test_average_deck_url(name, bracket, expected):
@@ -54,6 +55,8 @@ def test_average_deck_url(name, bracket, expected):
         ("precon", "exhibition"),
         ("exhibition/budget", "exhibition/budget"),
         ("cedh-expensive", "cedh/expensive"),
+        ("exhibitition", "exhibition"),
+        ("exhibitition/expensive", "exhibition/expensive"),
     ],
 )
 def test_normalize_average_deck_bracket(value, expected):
