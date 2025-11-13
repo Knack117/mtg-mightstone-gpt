@@ -232,6 +232,7 @@ def _collect_tag_entries(source: Any, *, treat_as_tag: bool) -> List[str]:
         return tags
 
     if isinstance(source, dict):
+        nested_candidates: List[Any] = []
         if treat_as_tag:
             for key in ("name", "label", "title", "displayName", "theme"):
                 raw = source.get(key)
@@ -239,12 +240,17 @@ def _collect_tag_entries(source: Any, *, treat_as_tag: bool) -> List[str]:
                     cleaned = _clean_text(raw)
                     if cleaned:
                         tags.append(cleaned)
-                    break
+                        break
+            else:
+                for nested_key in ("tag", "theme"):
+                    nested_value = source.get(nested_key)
+                    if nested_value is not None:
+                        nested_candidates.append(nested_value)
 
         for key, value in source.items():
             key_lower = key.lower() if isinstance(key, str) else ""
-            if key_lower in {"tags", "themes", "items", "list", "entries", "values", "chips"}:
-                tags.extend(_collect_tag_entries(value, treat_as_tag=True))
+            if key_lower in {"tags", "themes", "items", "list", "entries", "values", "chips", "tag", "tagitem"}:
+                nested_candidates.append(value)
             elif key_lower in {
                 "sections",
                 "groups",
@@ -252,8 +258,14 @@ def _collect_tag_entries(source: Any, *, treat_as_tag: bool) -> List[str]:
                 "tabs",
                 "taggroups",
                 "collections",
+                "edges",
+                "nodes",
+                "node",
             }:
                 tags.extend(_collect_tag_entries(value, treat_as_tag=False))
+
+        for candidate in nested_candidates:
+            tags.extend(_collect_tag_entries(candidate, treat_as_tag=True))
 
         return tags
 
