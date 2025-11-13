@@ -5,12 +5,52 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, Tuple
 from urllib.parse import quote_plus
 
 import requests
 
 UA = "MightstoneBot/1.0 (+https://github.com/Knack117/mtg-mightstone-gpt)"
+
+
+_ALLOWED_AVERAGE_DECK_PATHS: Tuple[str, ...] = (
+    "",
+    "exhibition",
+    "exhibition/budget",
+    "exhibition/expensive",
+    "core",
+    "upgraded",
+    "optimized",
+    "cedh",
+    "cedh/budget",
+    "cedh/expensive",
+)
+
+_AVERAGE_DECK_BRACKET_ALIASES = {
+    "": "",
+    "all": "",
+    "average": "",
+    "default": "",
+    "exhibition": "exhibition",
+    "precon": "exhibition",
+    "core": "core",
+    "upgraded": "upgraded",
+    "optimized": "optimized",
+    "cedh": "cedh",
+    "1": "exhibition",
+    "2": "core",
+    "3": "upgraded",
+    "4": "optimized",
+    "5": "cedh",
+    "exhibition/budget": "exhibition/budget",
+    "exhibition-budget": "exhibition/budget",
+    "exhibition/expensive": "exhibition/expensive",
+    "exhibition-expensive": "exhibition/expensive",
+    "cedh/budget": "cedh/budget",
+    "cedh-budget": "cedh/budget",
+    "cedh/expensive": "cedh/expensive",
+    "cedh-expensive": "cedh/expensive",
+}
 
 
 def _strip_accents(text: str) -> str:
@@ -80,20 +120,42 @@ def _find_commander_page(session: requests.Session, name: str) -> Optional[str]:
     return f"https://edhrec.com{match.group(1)}" if match else None
 
 
+_AVERAGE_DECK_PATH_RE = re.compile(
+    r"^/average-decks/([a-z0-9\-]+)(?:/([a-z0-9\-]+)(?:/([a-z0-9\-]+))?)?$"
+)
+
+
 def _pick_avg_link(html: str, bracket: str) -> Optional[Dict[str, Set[str] | Optional[str]]]:
-    links = re.findall(r'href="(/average-decks/[a-z0-9\-]+/[a-z0-9\-]+)"', html)
+    links = re.findall(r'href="(/average-decks/[a-z0-9\-]+(?:/[a-z0-9\-]+){0,2})"', html)
     links = list(dict.fromkeys(links))
     if not links:
         return None
 
-    buckets = {path.rsplit("/", 1)[-1] for path in links}
-    lower_bracket = (bracket or "").strip().lower()
+    normalized_links: list[Tuple[str, str]] = []
+    buckets: Set[str] = set()
+
     for path in links:
-        if path.endswith(f"/{lower_bracket}"):
+        match = _AVERAGE_DECK_PATH_RE.match(path)
+        if not match:
+            continue
+        bracket_parts = [part for part in match.groups()[1:] if part]
+        raw_bracket = "/".join(bracket_parts)
+        normalized = _coerce_average_deck_bracket(raw_bracket)
+        if normalized is None:
+            continue
+        normalized_links.append((path, normalized))
+        buckets.add(display_average_deck_bracket(normalized))
+
+    if not normalized_links:
+        return None
+
+    for path, normalized in normalized_links:
+        if normalized == bracket:
             return {
                 "url": f"https://edhrec.com{path}",
                 "available": buckets,
             }
+
     return {"url": None, "available": buckets}
 
 
@@ -105,9 +167,10 @@ def find_average_deck_url(
     if not name or not (name.strip()):
         raise ValueError({"code": "NAME_REQUIRED", "message": "Commander name is required"})
 
-    normalized_bracket = (bracket or "").strip().lower()
-    if not normalized_bracket:
+    if bracket is None or not bracket.strip():
         raise ValueError({"code": "BRACKET_REQUIRED", "message": "Bracket is required"})
+
+    normalized_bracket = normalize_average_deck_bracket(bracket)
 
     commander_url = _find_commander_page(session, name)
     if commander_url:
@@ -132,23 +195,35 @@ def find_average_deck_url(
         slug = _slugify(variant)
         if not slug:
             continue
-        url = f"https://edhrec.com/average-decks/{slug}/{normalized_bracket}"
+        if normalized_bracket:
+            url = f"https://edhrec.com/average-decks/{slug}/{normalized_bracket}"
+        else:
+            url = f"https://edhrec.com/average-decks/{slug}"
         response = session.get(url, headers={"User-Agent": UA}, timeout=15)
         if response.status_code == 200:
             return {
                 "source_url": url,
-                "available_brackets": {normalized_bracket},
+                "available_brackets": {display_average_deck_bracket(normalized_bracket)},
             }
 
     query = quote_plus(name or "")
     search_url = f"https://edhrec.com/search?q={query}"
     html = _fetch_html(session, search_url)
-    match = re.search(r'href="(/average-decks/[a-z0-9\-]+/[a-z0-9\-]+)"', html)
+    match = re.search(r'href="(/average-decks/[a-z0-9\-]+(?:/[a-z0-9\-]+){1,2})"', html)
     if match:
-        url = f"https://edhrec.com{match.group(1)}"
+        path = match.group(1)
+        match_path = _AVERAGE_DECK_PATH_RE.match(path)
+        if match_path:
+            bracket_parts = [part for part in match_path.groups()[1:] if part]
+            normalized = _coerce_average_deck_bracket("/".join(bracket_parts))
+        else:
+            normalized = None
+        url = f"https://edhrec.com{path}"
         return {
             "source_url": url,
-            "available_brackets": {url.rsplit("/", 1)[-1]},
+            "available_brackets": {
+                display_average_deck_bracket(normalized) if normalized is not None else bracket
+            },
         }
 
     raise ValueError(
@@ -163,6 +238,51 @@ def find_average_deck_url(
     )
 
 
+def display_average_deck_bracket(path: str) -> str:
+    return "all" if not path else path
+
+
+def allowed_average_deck_brackets() -> Tuple[str, ...]:
+    """Return the supported average-deck bracket identifiers."""
+
+    return tuple(display_average_deck_bracket(path) for path in _ALLOWED_AVERAGE_DECK_PATHS)
+
+
+def normalize_average_deck_bracket(bracket: Optional[str]) -> str:
+    """Return the normalized EDHREC average-deck bracket path."""
+
+    text = (bracket or "").strip().lower()
+    text = text.replace("\\", "/")
+    text = re.sub(r"/+", "/", text)
+    text = text.strip("/")
+
+    if not text:
+        return ""
+
+    normalized = _AVERAGE_DECK_BRACKET_ALIASES.get(text, text)
+    if normalized in _ALLOWED_AVERAGE_DECK_PATHS:
+        return normalized
+
+    raise ValueError(
+        {
+            "code": "BRACKET_UNSUPPORTED",
+            "message": f"Bracket '{bracket}' is not supported",
+            "allowed_brackets": allowed_average_deck_brackets(),
+        }
+    )
+
+
+def _coerce_average_deck_bracket(bracket: Optional[str]) -> Optional[str]:
+    try:
+        return normalize_average_deck_bracket(bracket)
+    except ValueError:
+        return None
+
+
 __all__ = [
     "find_average_deck_url",
+    "allowed_average_deck_brackets",
+    "display_average_deck_bracket",
+    "normalize_average_deck_bracket",
 ]
+
