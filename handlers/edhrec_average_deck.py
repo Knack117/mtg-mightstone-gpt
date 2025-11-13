@@ -14,10 +14,13 @@ def _format_detail(detail: Any) -> Any:
 def edhrec_average_deck(name: str, bracket: str = "upgraded") -> Tuple[Dict[str, Any], int]:
     session = requests.Session()
     try:
+        bracket_text = ""
+        if bracket is not None:
+            bracket_text = str(bracket).strip()
         try:
             payload = fetch_average_deck(
                 name=(name or ""),
-                bracket=(bracket or ""),
+                bracket=bracket_text,
                 session=session,
             )
         except ValueError as exc:
@@ -36,7 +39,7 @@ def edhrec_average_deck(name: str, bracket: str = "upgraded") -> Tuple[Dict[str,
                 "resolved_bracket": payload.get("bracket"),
                 "request": {
                     "name": name,
-                    "bracket": bracket,
+                    "bracket": bracket_text,
                     "source_url": None,
                 },
                 "commander_tags": payload.get("commander_tags", []),

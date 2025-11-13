@@ -748,12 +748,21 @@ def _split_tag_name_and_count(text: str) -> Tuple[str, Optional[int]]:
     return cleaned, None
 
 
+def _clean_commander_tag_name(name: str) -> Optional[str]:
+    """Return a normalized commander tag name or ``None`` if invalid."""
+
+    cleaned = normalize_commander_tags([name])
+    if not cleaned:
+        return None
+    return cleaned[0]
+
+
 def _extract_tags_with_counts_from_html(html: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
     merged: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
     def record(name: str, count: Optional[int]) -> None:
-        normalized = name.strip()
+        normalized = _clean_commander_tag_name(name)
         if not normalized:
             return
         key = normalized.lower()
@@ -801,7 +810,7 @@ def _extract_tags_with_counts_from_payload(payload: Dict[str, Any]) -> List[Dict
     merged: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
     def record(name: str, count: Optional[int]) -> None:
-        normalized = (name or "").strip()
+        normalized = _clean_commander_tag_name(name or "")
         if not normalized:
             return
         key = normalized.lower()
@@ -883,16 +892,19 @@ def _merge_tag_sources(*sources: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
             if not isinstance(entry, dict):
                 continue
             name = entry.get("name")
-            if not isinstance(name, str) or not name.strip():
+            if not isinstance(name, str):
                 continue
-            key = name.strip().lower()
+            normalized_name = _clean_commander_tag_name(name)
+            if not normalized_name:
+                continue
+            key = normalized_name.lower()
             count = entry.get("deck_count")
             count_value = int(count) if isinstance(count, (int, float)) else None
             if key in merged:
                 if merged[key]["deck_count"] is None and count_value is not None:
                     merged[key]["deck_count"] = count_value
             else:
-                merged[key] = {"name": name.strip(), "deck_count": count_value}
+                merged[key] = {"name": normalized_name, "deck_count": count_value}
     return list(merged.values())
 
 

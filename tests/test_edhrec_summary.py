@@ -62,6 +62,7 @@ def _build_commander_html_payload():
                     "themes": [
                         {"name": "Proliferate"},
                         {"name": "Angels"},
+                        {"name": "Kindred"},
                     ],
                 },
                 "data": {
@@ -113,6 +114,8 @@ def _build_commander_html_payload():
         <h2>Tags</h2>
         <a href=\"/tags/proliferate\" data-tag-count=\"1234\">Proliferate (1,234)</a>
         <a href=\"/tags/angels\"><span>Angels</span><span>987 decks</span></a>
+        <a href=\"/themes/kindred\" data-tag-count=\"555\">Kindred</a>
+        <a href=\"/themes/commander-themes\" data-tag-count=\"777\">Themes</a>
         <script id=\"__NEXT_DATA__\" type=\"application/json\">{json.dumps(next_data)}</script>
       </body>
     </html>
@@ -151,6 +154,8 @@ def test_fetch_commander_summary_parses_sections_and_tags():
     assert tags_by_name["Angels"]["deck_count"] == 987
 
     assert {tag["name"] for tag in summary["tags"]} >= {"Proliferate", "Angels"}
+    assert "Kindred" not in tags_by_name
+    assert "Themes" not in tags_by_name
 
     top_tag = summary["top_tags"][0]
     assert top_tag["name"] == "Proliferate"
