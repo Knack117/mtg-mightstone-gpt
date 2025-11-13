@@ -748,12 +748,21 @@ def _split_tag_name_and_count(text: str) -> Tuple[str, Optional[int]]:
     return cleaned, None
 
 
+def _clean_commander_tag_name(name: str) -> Optional[str]:
+    """Return a normalized commander tag name or ``None`` if invalid."""
+
+    cleaned = normalize_commander_tags([name])
+    if not cleaned:
+        return None
+    return cleaned[0]
+
+
 def _extract_tags_with_counts_from_html(html: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
     merged: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
     def record(name: str, count: Optional[int]) -> None:
-        normalized = name.strip()
+        normalized = _clean_commander_tag_name(name)
         if not normalized:
             return
         key = normalized.lower()
@@ -801,7 +810,7 @@ def _extract_tags_with_counts_from_payload(payload: Dict[str, Any]) -> List[Dict
     merged: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
     def record(name: str, count: Optional[int]) -> None:
-        normalized = (name or "").strip()
+        normalized = _clean_commander_tag_name(name or "")
         if not normalized:
             return
         key = normalized.lower()
@@ -883,17 +892,27 @@ def _merge_tag_sources(*sources: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
             if not isinstance(entry, dict):
                 continue
             name = entry.get("name")
-            if not isinstance(name, str) or not name.strip():
+            if not isinstance(name, str):
                 continue
-            key = name.strip().lower()
+            normalized_name = _clean_commander_tag_name(name)
+            if not normalized_name:
+                continue
+            key = normalized_name.lower()
             count = entry.get("deck_count")
             count_value = int(count) if isinstance(count, (int, float)) else None
             if key in merged:
                 if merged[key]["deck_count"] is None and count_value is not None:
                     merged[key]["deck_count"] = count_value
             else:
-                merged[key] = {"name": name.strip(), "deck_count": count_value}
-    return list(merged.values())
+                merged[key] = {"name": normalized_name, "deck_count": count_value}
+    filtered: List[Dict[str, Any]] = []
+    for entry in merged.values():
+        cleaned = normalize_commander_tags([entry.get("name", "")])
+        if not cleaned:
+            continue
+        name = cleaned[0]
+        filtered.append({"name": name, "deck_count": entry.get("deck_count")})
+    return filtered
 
 
 def _sort_tags_by_deck_count(tags: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1080,6 +1099,13 @@ def fetch_commander_summary(
             ({"name": tag, "deck_count": None} for tag in json_tag_names),
             ({"name": tag, "deck_count": None} for tag in html_tag_names),
         )
+
+        if not combined_tags:
+            fallback_names = normalize_commander_tags(json_tag_names + html_tag_names)
+            if fallback_names:
+                combined_tags = [
+                    {"name": name, "deck_count": None} for name in fallback_names
+                ]
 
         top_tags = _sort_tags_by_deck_count(combined_tags)[:10]
 

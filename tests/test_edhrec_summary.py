@@ -62,6 +62,7 @@ def _build_commander_html_payload():
                     "themes": [
                         {"name": "Proliferate"},
                         {"name": "Angels"},
+                        {"name": "Kindred"},
                     ],
                 },
                 "data": {
@@ -113,6 +114,8 @@ def _build_commander_html_payload():
         <h2>Tags</h2>
         <a href=\"/tags/proliferate\" data-tag-count=\"1234\">Proliferate (1,234)</a>
         <a href=\"/tags/angels\"><span>Angels</span><span>987 decks</span></a>
+        <a href=\"/themes/kindred\" data-tag-count=\"555\">Kindred</a>
+        <a href=\"/themes/commander-themes\" data-tag-count=\"777\">Themes</a>
         <script id=\"__NEXT_DATA__\" type=\"application/json\">{json.dumps(next_data)}</script>
       </body>
     </html>
@@ -151,11 +154,81 @@ def test_fetch_commander_summary_parses_sections_and_tags():
     assert tags_by_name["Angels"]["deck_count"] == 987
 
     assert {tag["name"] for tag in summary["tags"]} >= {"Proliferate", "Angels"}
+    assert "Kindred" not in tags_by_name
+    assert "Themes" not in tags_by_name
 
     top_tag = summary["top_tags"][0]
     assert top_tag["name"] == "Proliferate"
     assert top_tag["deck_count"] == 1234
 
+
+def test_fetch_commander_summary_handles_missing_tag_counts():
+    name = "Kibo, Uktabi Prince"
+    slug = "kibo-uktabi-prince"
+    url = f"https://edhrec.com/commanders/{slug}"
+
+    next_data = {
+        "props": {
+            "pageProps": {
+                "commander": {
+                    "metadata": {
+                        "tagCloud": {
+                            "groups": [
+                                {"tags": [{"name": "Token Swarm"}, {"name": "Themes"}]}
+                            ]
+                        }
+                    },
+                    "themes": [
+                        {"name": "Card Draw"},
+                        {"name": "Kindred"},
+                    ],
+                },
+                "data": {
+                    "container": {
+                        "json_dict": {
+                            "cardlists": [
+                                {
+                                    "header": "High Synergy Cards",
+                                    "cards": [
+                                        {
+                                            "name": "Sol Ring",
+                                            "synergy": 0.1,
+                                            "num_decks": 10,
+                                            "potential_decks": 100,
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    html = f"""
+    <html>
+      <body>
+        <section>
+          <h2>Tags</h2>
+          <a href=\"/themes/kindred\">Kindred</a>
+          <a href=\"/themes/commander-themes\">Themes</a>
+        </section>
+        <script id=\"__NEXT_DATA__\" type=\"application/json\">{json.dumps(next_data)}</script>
+      </body>
+    </html>
+    """
+
+    session = DummySession({url: DummyResponse(html)})
+
+    summary = edhrec.fetch_commander_summary(name, session=session)
+
+    tag_names = [entry["name"] for entry in summary["tags"]]
+
+    assert "Kindred" not in tag_names
+    assert "Themes" not in tag_names
+    assert tag_names == ["Card Draw", "Token Swarm"]
+    assert all(entry["deck_count"] is None for entry in summary["tags"])
 
 def test_fetch_commander_summary_budget_validation():
     with pytest.raises(ValueError):
