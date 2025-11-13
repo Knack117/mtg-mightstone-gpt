@@ -1,4 +1,5 @@
-# app.py
+"""Revised app.py based off previous commit (HEAD~1) with commander card summary route."""
+
 import json
 import logging
 import os
@@ -21,7 +22,7 @@ from utils.edhrec_commander import (
     extract_commander_tags_from_json,
     normalize_commander_tags,
 )
-from services.edhrec import EdhrecError, fetch_average_deck
+from services.edhrec import EdhrecError, fetch_average_deck, fetch_commander_summary
 from utils.identity import canonicalize_identity
 
 # -----------------------------------------------------------------------------
@@ -642,11 +643,9 @@ async def fetch_theme_tag(name: str, identity: str) -> PageTheme:
 # Routes
 # -----------------------------------------------------------------------------
 
-
 @app.get("/privacy", response_class=HTMLResponse)
 def privacy():
     return HTMLResponse(content=PRIVACY_HTML, media_type="text/html; charset=utf-8")
-
 
 # Maintain the legacy underscore route for backward compatibility but prefer the hyphenated path.
 @app.get("/edhrec/average-deck")
@@ -750,6 +749,31 @@ async def commander_summary(
     return PageTheme.parse_obj(payload)
 
 
+@app.get("/commander/card-summary")
+def commander_card_summary(
+    name: str = Query(..., description="Commander name (printed name)"),
+    budget: Optional[str] = Query(None, description="Optional budget segment ('budget' or 'expensive')"),
+):
+    """
+    Fetch a detailed card summary for a commander. This endpoint scrapes EDHREC to
+    retrieve card categories (e.g. New Cards, High Synergy Cards, Top Cards, Creatures,
+    Instants, Sorceries, etc.), computes inclusion and synergy percentages for each
+    card, and returns the top tags from the commander’s page. A budget may be
+    specified ("budget" or "expensive") to filter the data to the respective deck
+    list on EDHREC.
+    """
+    try:
+        summary = fetch_commander_summary(name=name, budget=budget)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except EdhrecError as exc:
+        return {"error": exc.to_dict()}
+    except Exception as exc:
+        log.exception("Commander card summary fetch failed.")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return summary
+
+
 @app.get("/edhrec/theme", response_model=PageTheme)
 async def edhrec_theme(
     name: str = Query(..., description="EDHREC tag/theme name, e.g. 'prowess'"),
@@ -801,6 +825,7 @@ async def edhrec_theme_nextdebug(
     }
 
     return JSONResponse(content=debug_payload)
+
 
 @app.get("/cards/search")
 async def cards_search(
