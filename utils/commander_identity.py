@@ -51,6 +51,13 @@ def commander_slug_candidates(name: str) -> List[str]:
     if combined:
         candidates.append(combined)
 
+    if len(pieces) > 1:
+        reversed_combined = "-".join(
+            filter(None, (_slugify_piece(piece) for piece in reversed(pieces)))
+        )
+        if reversed_combined and reversed_combined not in candidates:
+            candidates.append(reversed_combined)
+
     first_piece = _slugify_piece(pieces[0])
     if first_piece and first_piece not in candidates:
         candidates.append(first_piece)

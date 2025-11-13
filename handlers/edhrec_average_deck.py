@@ -1,36 +1,57 @@
-import os
-from typing import Tuple
+from __future__ import annotations
+
+from typing import Any, Dict, Tuple
 
 import requests
-from urllib.parse import urlencode
 
-MIGHTSTONE_BASE = os.getenv("MIGHTSTONE_BASE", "https://mtg-mightstone-gpt.onrender.com")
-TIMEOUT = 25
-VALID_BRACKETS = {"precon", "upgraded"}
+from services.edhrec import EdhrecError, fetch_average_deck
 
 
-def edhrec_average_deck(name: str, bracket: str = "upgraded") -> Tuple[dict, int]:
-    if not name or not name.strip():
-        return {"error": {"message": "Missing 'name'"}}, 400
+def _format_detail(detail: Any) -> Any:
+    return detail if isinstance(detail, (dict, list)) else str(detail)
 
-    normalized_bracket = (bracket or "upgraded").strip().lower()
-    if normalized_bracket not in VALID_BRACKETS:
-        return {"error": {"message": "Bracket must be 'precon' or 'upgraded'"}}, 400
 
-    params = urlencode({"name": name, "bracket": normalized_bracket})
-    url = f"{MIGHTSTONE_BASE}/edhrec/average-deck?{params}"
-
+def edhrec_average_deck(name: str, bracket: str = "upgraded") -> Tuple[Dict[str, Any], int]:
+    session = requests.Session()
     try:
-        response = requests.get(url, timeout=TIMEOUT)
-    except requests.RequestException as exc:
-        return {"error": {"message": f"Error contacting Mightstone service: {exc}"}}, 502
+        try:
+            payload = fetch_average_deck(
+                name=(name or ""),
+                bracket=(bracket or ""),
+                session=session,
+            )
+        except ValueError as exc:
+            detail = _format_detail(exc.args[0] if exc.args else str(exc))
+            return {"detail": detail}, 400
+        except EdhrecError as exc:
+            return {"error": exc.to_dict()}, 200
+        except Exception as exc:
+            return {"detail": f"Failed to fetch average deck: {exc}"}, 502
 
-    try:
-        payload = response.json()
-    except ValueError:
-        return {"error": {"message": "Malformed response from Mightstone service"}}, 502
+        response: Dict[str, Any] = {
+            "cards": payload.get("cards", []),
+            "commander_card": payload.get("commander_card"),
+            "meta": {
+                "source_url": payload.get("source_url"),
+                "resolved_bracket": payload.get("bracket"),
+                "request": {
+                    "name": name,
+                    "bracket": bracket,
+                    "source_url": None,
+                },
+                "commander_tags": payload.get("commander_tags", []),
+                "commander_high_synergy_cards": payload.get("commander_high_synergy_cards", []),
+                "commander_top_cards": payload.get("commander_top_cards", []),
+                "commander_game_changers": payload.get("commander_game_changers", []),
+            },
+            "error": None,
+        }
 
-    if response.status_code >= 400:
-        return payload, response.status_code
+        if payload.get("commander"):
+            response["meta"]["commander"] = payload["commander"]
+        if "available_brackets" in payload:
+            response["meta"]["available_brackets"] = payload["available_brackets"]
 
-    return payload, response.status_code or 200
+        return response, 200
+    finally:
+        session.close()
