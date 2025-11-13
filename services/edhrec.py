@@ -704,6 +704,33 @@ def _parse_count(value: Optional[str]) -> Optional[int]:
         return None
 
 
+def _parse_percentage(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        amount = float(value)
+        if -1.0 <= amount <= 1.0:
+            amount *= 100.0
+        return round(amount, 2)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        match = re.search(r"[-+]?[0-9]+(?:[.,][0-9]+)?", text)
+        if not match:
+            return None
+        try:
+            amount = float(match.group(0).replace(",", ""))
+        except ValueError:
+            return None
+        if "%" in text or "percent" in text.lower():
+            return round(amount, 2)
+        if -1.0 <= amount <= 1.0:
+            amount *= 100.0
+        return round(amount, 2)
+    return None
+
+
 def _split_tag_name_and_count(text: str) -> Tuple[str, Optional[int]]:
     cleaned = text.strip()
     if not cleaned:
@@ -917,28 +944,63 @@ def _parse_cardlists_from_json(payload: Optional[Dict[str, Any]]) -> Dict[str, L
                         name = " // ".join(parts)
                 if not name:
                     continue
-                synergy = entry.get("synergy")
-                synergy_pct = (
-                    round(float(synergy) * 100, 2)
-                    if isinstance(synergy, (int, float))
-                    else None
+                synergy_pct = _parse_percentage(
+                    entry.get("synergy")
+                    or entry.get("synergy_percent")
+                    or entry.get("synergyPercent")
+                    or entry.get("synergy_pct")
                 )
-                num_decks = entry.get("num_decks") or entry.get("numDecks") or entry.get("inclusion")
-                potential_decks = entry.get("potential_decks") or entry.get("potentialDecks")
+
+                num_decks: Optional[int] = None
+                for key in (
+                    "num_decks",
+                    "numDecks",
+                    "deckCount",
+                    "deck_count",
+                    "count",
+                    "decks",
+                ):
+                    num_decks = _parse_count(entry.get(key))
+                    if num_decks is not None:
+                        break
+
+                potential_decks: Optional[int] = None
+                for key in (
+                    "potential_decks",
+                    "potentialDecks",
+                    "totalDecks",
+                    "potential",
+                    "deckSampleSize",
+                ):
+                    potential_decks = _parse_count(entry.get(key))
+                    if potential_decks is not None:
+                        break
+
                 inclusion_pct: Optional[float] = None
                 if (
-                    isinstance(num_decks, (int, float))
-                    and isinstance(potential_decks, (int, float))
+                    isinstance(num_decks, int)
+                    and isinstance(potential_decks, int)
                     and potential_decks
                 ):
                     try:
-                        inclusion_pct = round(float(num_decks) / float(potential_decks) * 100, 2)
+                        inclusion_pct = round(
+                            float(num_decks) / float(potential_decks) * 100, 2
+                        )
                     except ZeroDivisionError:
                         inclusion_pct = None
+                if inclusion_pct is None:
+                    inclusion_pct = _parse_percentage(
+                        entry.get("inclusion")
+                        or entry.get("inclusion_percent")
+                        or entry.get("inclusionPercent")
+                        or entry.get("inclusion_pct")
+                    )
                 cards_out.append(
                     {
                         "name": name,
                         "inclusion_percent": inclusion_pct,
+                        "deck_count": num_decks,
+                        "potential_deck_count": potential_decks,
                         "synergy_percent": synergy_pct,
                     }
                 )

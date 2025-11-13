@@ -139,11 +139,22 @@ def test_fetch_commander_summary_parses_sections_and_tags():
     assert synergy_cards[0]["name"] == "Evolution Sage"
     assert synergy_cards[0]["synergy_percent"] == 32.0
     assert synergy_cards[0]["inclusion_percent"] == 40.0
+    assert synergy_cards[0]["deck_count"] == 120
+    assert synergy_cards[0]["potential_deck_count"] == 300
 
     assert categories["Creatures"][0]["name"] == "Atraxa, Praetors' Voice"
+    assert categories["Creatures"][0]["deck_count"] == 150
+    assert categories["Creatures"][0]["potential_deck_count"] == 300
     assert isinstance(summary["tags"], list)
+    tags_by_name = {tag["name"]: tag for tag in summary["tags"]}
+    assert tags_by_name["Proliferate"]["deck_count"] == 1234
+    assert tags_by_name["Angels"]["deck_count"] == 987
+
     assert {tag["name"] for tag in summary["tags"]} >= {"Proliferate", "Angels"}
-    assert summary["top_tags"][0]["name"] == "Proliferate"
+
+    top_tag = summary["top_tags"][0]
+    assert top_tag["name"] == "Proliferate"
+    assert top_tag["deck_count"] == 1234
 
 
 def test_fetch_commander_summary_budget_validation():
