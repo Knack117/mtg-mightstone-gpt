@@ -61,6 +61,9 @@ def test_average_deck_fetch_smoke(name, bracket):
     assert 95 <= len(cards) <= 100
     assert all("name" in card and "qty" in card for card in cards)
     assert isinstance(data.get("commander_tags"), list)
+    assert isinstance(data.get("commander_high_synergy_cards"), list)
+    assert isinstance(data.get("commander_top_cards"), list)
+    assert isinstance(data.get("commander_game_changers"), list)
 
     if data.get("commander_card"):
         assert "name" in data["commander_card"]
@@ -75,6 +78,9 @@ def test_average_deck_fetch_with_source_url():
     assert data["source_url"] == url
     assert data["bracket"] == "upgraded"
     assert isinstance(data.get("commander_tags"), list)
+    assert isinstance(data.get("commander_high_synergy_cards"), list)
+    assert isinstance(data.get("commander_top_cards"), list)
+    assert isinstance(data.get("commander_game_changers"), list)
 
 
 def test_jodah_upgraded_discovers_url():

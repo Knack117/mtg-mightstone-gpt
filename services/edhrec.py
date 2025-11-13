@@ -17,6 +17,7 @@ from edhrec import _slugify as _discover_slugify
 from edhrec import find_average_deck_url
 from utils.edhrec_commander import (
     extract_build_id_from_html,
+    extract_commander_sections_from_json,
     extract_commander_tags_from_html,
     extract_commander_tags_from_json,
     normalize_commander_tags,
@@ -44,6 +45,12 @@ _HEADERS = {
 }
 
 _CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
+
+
+@dataclass
+class CommanderMetadata:
+    tags: List[str]
+    sections: Dict[str, List[str]]
 
 
 class EdhrecError(RuntimeError):
@@ -191,23 +198,40 @@ def _fetch_average_deck_payload(
     return json.loads(json.dumps(result))
 
 
-def _fetch_commander_tags(slug: str, session: requests.Session) -> List[str]:
+def _fetch_commander_metadata(slug: str, session: requests.Session) -> CommanderMetadata:
     if not slug:
-        return []
+        return CommanderMetadata(tags=[], sections={
+            "High Synergy Cards": [],
+            "Top Cards": [],
+            "Game Changers": [],
+        })
 
     commander_url = f"https://edhrec.com/commanders/{slug}"
     try:
         response = session.get(commander_url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
     except requests.RequestException:
-        return []
+        return CommanderMetadata(tags=[], sections={
+            "High Synergy Cards": [],
+            "Top Cards": [],
+            "Game Changers": [],
+        })
 
     if response.status_code != 200:
-        return []
+        return CommanderMetadata(tags=[], sections={
+            "High Synergy Cards": [],
+            "Top Cards": [],
+            "Game Changers": [],
+        })
 
     html = response.text
     html_tags = extract_commander_tags_from_html(html)
     build_id = extract_build_id_from_html(html)
     json_tags: List[str] = []
+    sections: Dict[str, List[str]] = {
+        "High Synergy Cards": [],
+        "Top Cards": [],
+        "Game Changers": [],
+    }
 
     if build_id:
         json_url = f"https://edhrec.com/_next/data/{build_id}/commanders/{slug}.json"
@@ -223,8 +247,10 @@ def _fetch_commander_tags(slug: str, session: requests.Session) -> List[str]:
                     payload = None
                 else:
                     json_tags = extract_commander_tags_from_json(payload)
+                    sections = extract_commander_sections_from_json(payload)
 
-    return normalize_commander_tags(html_tags + json_tags)
+    tags = normalize_commander_tags(html_tags + json_tags)
+    return CommanderMetadata(tags=tags, sections=sections)
 
 
 def _find_next_data(html: str, url: str) -> Dict[str, Any]:
@@ -480,7 +506,14 @@ def fetch_average_deck(
         session = requests.Session()
         own_session = True
 
-    commander_tags: List[str] = []
+    commander_metadata = CommanderMetadata(
+        tags=[],
+        sections={
+            "High Synergy Cards": [],
+            "Top Cards": [],
+            "Game Changers": [],
+        },
+    )
 
     try:
         if source_url:
@@ -504,9 +537,16 @@ def fetch_average_deck(
             source_url=normalized_url,
         )
         try:
-            commander_tags = _fetch_commander_tags(slug, session)
+            commander_metadata = _fetch_commander_metadata(slug, session)
         except Exception:  # pragma: no cover - defensive network handling
-            commander_tags = []
+            commander_metadata = CommanderMetadata(
+                tags=[],
+                sections={
+                    "High Synergy Cards": [],
+                    "Top Cards": [],
+                    "Game Changers": [],
+                },
+            )
     finally:
         if own_session:
             session.close()
@@ -547,7 +587,10 @@ def fetch_average_deck(
         "source_url": payload.get("source_url"),
         "cards": final_cards,
         "commander_card": commander_card,
-        "commander_tags": commander_tags,
+        "commander_tags": commander_metadata.tags,
+        "commander_high_synergy_cards": commander_metadata.sections.get("High Synergy Cards", []),
+        "commander_top_cards": commander_metadata.sections.get("Top Cards", []),
+        "commander_game_changers": commander_metadata.sections.get("Game Changers", []),
     }
 
     if result["commander"] is None:
