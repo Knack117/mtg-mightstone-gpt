@@ -15,6 +15,12 @@ from bs4 import BeautifulSoup
 
 from edhrec import _slugify as _discover_slugify
 from edhrec import find_average_deck_url
+from utils.edhrec_commander import (
+    extract_build_id_from_html,
+    extract_commander_tags_from_html,
+    extract_commander_tags_from_json,
+    normalize_commander_tags,
+)
 
 __all__ = [
     "EdhrecError",
@@ -183,6 +189,42 @@ def _fetch_average_deck_payload(
     }
     _CACHE[key] = (now, json.loads(json.dumps(result)))
     return json.loads(json.dumps(result))
+
+
+def _fetch_commander_tags(slug: str, session: requests.Session) -> List[str]:
+    if not slug:
+        return []
+
+    commander_url = f"https://edhrec.com/commanders/{slug}"
+    try:
+        response = session.get(commander_url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
+        return []
+
+    if response.status_code != 200:
+        return []
+
+    html = response.text
+    html_tags = extract_commander_tags_from_html(html)
+    build_id = extract_build_id_from_html(html)
+    json_tags: List[str] = []
+
+    if build_id:
+        json_url = f"https://edhrec.com/_next/data/{build_id}/commanders/{slug}.json"
+        try:
+            json_response = session.get(json_url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException:
+            json_response = None
+        else:
+            if json_response.status_code == 200:
+                try:
+                    payload = json_response.json()
+                except ValueError:
+                    payload = None
+                else:
+                    json_tags = extract_commander_tags_from_json(payload)
+
+    return normalize_commander_tags(html_tags + json_tags)
 
 
 def _find_next_data(html: str, url: str) -> Dict[str, Any]:
@@ -438,6 +480,8 @@ def fetch_average_deck(
         session = requests.Session()
         own_session = True
 
+    commander_tags: List[str] = []
+
     try:
         if source_url:
             normalized_url, slug, normalized_bracket = _normalize_average_deck_url(source_url)
@@ -459,6 +503,10 @@ def fetch_average_deck(
             session=session,
             source_url=normalized_url,
         )
+        try:
+            commander_tags = _fetch_commander_tags(slug, session)
+        except Exception:  # pragma: no cover - defensive network handling
+            commander_tags = []
     finally:
         if own_session:
             session.close()
@@ -499,6 +547,7 @@ def fetch_average_deck(
         "source_url": payload.get("source_url"),
         "cards": final_cards,
         "commander_card": commander_card,
+        "commander_tags": commander_tags,
     }
 
     if result["commander"] is None:
