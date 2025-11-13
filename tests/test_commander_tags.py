@@ -6,6 +6,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from utils.edhrec_commander import (
+    extract_commander_sections_from_json,
     extract_commander_tags_from_html,
     extract_commander_tags_from_json,
     normalize_commander_tags,
@@ -13,12 +14,21 @@ from utils.edhrec_commander import (
 
 
 HTML_SAMPLE = """
-<div class="commander-tags">
-  <a class="chip" href="/themes/five-color-goodstuff">Five-Color Goodstuff</a>
-  <a href="/tags/ramp/naya">Ramp</a>
-  <a href="/average-decks/jodah-the-unifier/upgraded">Ignore me</a>
-  <a href="https://edhrec.com/tags/legendary-matters">Legendary Matters</a>
-</div>
+<section>
+  <h2>Tags</h2>
+  <div class="commander-tags">
+    <a class="chip" href="/themes/five-color-goodstuff">Five-Color Goodstuff</a>
+    <a href="/tags/ramp/naya">Ramp</a>
+    <span>
+      <a href="/average-decks/jodah-the-unifier/upgraded">Ignore me</a>
+    </span>
+    <a href="https://edhrec.com/tags/legendary-matters">Legendary Matters</a>
+  </div>
+</section>
+<section>
+  <h2>High Synergy Cards</h2>
+  <a href="/cards/example-card">Not a tag</a>
+</section>
 """
 
 
@@ -39,6 +49,57 @@ JSON_SAMPLE = {
                         ]
                     }
                 },
+                "highSynergyCards": {
+                    "cards": [
+                        {"card": {"name": "Farseek"}},
+                        {"card": {"name": "Nature's Lore"}},
+                    ]
+                },
+                "topCards": [
+                    {"name": "Sol Ring"},
+                    {"name": "Arcane Signet"},
+                ],
+                "gameChangers": {
+                    "items": [
+                        {"cardName": "Jodah, the Unifier"},
+                        {"card": {"names": ["Atraxa", "Praetors' Voice"]}},
+                    ]
+                },
+            }
+        }
+    }
+}
+
+
+JSON_SAMPLE_WITH_GROUPS = {
+    "props": {
+        "pageProps": {
+            "commander": {
+                "themes": [
+                    {"name": "Legendary Matters"},
+                ],
+                "metadata": {
+                    "tagCloud": {
+                        "tabs": [
+                            {"id": "themes", "name": "Themes"},
+                            {"id": "kindred", "name": "Kindred"},
+                        ],
+                        "sections": [
+                            {
+                                "name": "Themes",
+                                "tags": [
+                                    {"name": "Token Swarm"},
+                                ],
+                            },
+                            {
+                                "name": "Kindred",
+                                "tags": [
+                                    {"name": "Squirrel"},
+                                ],
+                            },
+                        ],
+                    }
+                },
             }
         }
     }
@@ -53,6 +114,18 @@ def test_extract_commander_tags_from_html():
 def test_extract_commander_tags_from_json():
     tags = extract_commander_tags_from_json(JSON_SAMPLE)
     assert tags == ["Legendary Matters", "Cascade Value", "Ramp", "Five-Color Goodstuff"]
+
+
+def test_extract_commander_tags_from_json_ignores_group_labels():
+    tags = extract_commander_tags_from_json(JSON_SAMPLE_WITH_GROUPS)
+    assert tags == ["Legendary Matters", "Token Swarm", "Squirrel"]
+
+
+def test_extract_commander_sections_from_json():
+    sections = extract_commander_sections_from_json(JSON_SAMPLE)
+    assert sections["High Synergy Cards"] == ["Farseek", "Nature's Lore"]
+    assert sections["Top Cards"] == ["Sol Ring", "Arcane Signet"]
+    assert sections["Game Changers"] == ["Jodah, the Unifier", "Atraxa // Praetors' Voice"]
 
 
 def test_normalize_commander_tags_deduplicates():

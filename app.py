@@ -801,7 +801,7 @@ def edhrec_average_deck(
     name: Optional[str] = Query(None, description="Commander name (printed name)"),
     bracket: Optional[str] = Query(
         None,
-        description="Average deck bracket (e.g., precon, upgraded, budget)",
+        description="Average deck bracket (e.g., all, exhibition, exhibition/budget, upgraded)",
     ),
     source_url: Optional[str] = Query(
         None,
@@ -857,6 +857,13 @@ def edhrec_average_deck(
                 "source_url": source_url,
             },
             "commander_tags": payload.get("commander_tags", []),
+            "commander_high_synergy_cards": payload.get(
+                "commander_high_synergy_cards", []
+            ),
+            "commander_top_cards": payload.get("commander_top_cards", []),
+            "commander_game_changers": payload.get(
+                "commander_game_changers", []
+            ),
         },
         "error": None,
     }
