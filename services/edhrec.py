@@ -905,7 +905,14 @@ def _merge_tag_sources(*sources: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
                     merged[key]["deck_count"] = count_value
             else:
                 merged[key] = {"name": normalized_name, "deck_count": count_value}
-    return list(merged.values())
+    filtered: List[Dict[str, Any]] = []
+    for entry in merged.values():
+        cleaned = normalize_commander_tags([entry.get("name", "")])
+        if not cleaned:
+            continue
+        name = cleaned[0]
+        filtered.append({"name": name, "deck_count": entry.get("deck_count")})
+    return filtered
 
 
 def _sort_tags_by_deck_count(tags: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1092,6 +1099,13 @@ def fetch_commander_summary(
             ({"name": tag, "deck_count": None} for tag in json_tag_names),
             ({"name": tag, "deck_count": None} for tag in html_tag_names),
         )
+
+        if not combined_tags:
+            fallback_names = normalize_commander_tags(json_tag_names + html_tag_names)
+            if fallback_names:
+                combined_tags = [
+                    {"name": name, "deck_count": None} for name in fallback_names
+                ]
 
         top_tags = _sort_tags_by_deck_count(combined_tags)[:10]
 
