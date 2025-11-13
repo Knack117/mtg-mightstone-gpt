@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -135,6 +136,21 @@ class PageTheme(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+
+# -----------------------------------------------------------------------------
+# Commander Page Snapshot Helpers
+# -----------------------------------------------------------------------------
+
+
+@dataclass
+class CommanderPageSnapshot:
+    """In-memory representation of commander page metadata."""
+
+    url: str
+    html: str
+    tags: List[str]
+    json_payload: Optional[Dict[str, Any]] = None
+
 
 # -----------------------------------------------------------------------------
 # App & Clients
@@ -445,7 +461,7 @@ def _payload_has_collections(payload: Optional[Dict[str, Any]]) -> bool:
     return False
 
 
-async def try_fetch_commander_synergy(slug: str) -> Optional[Dict[str, Any]]:
+async def _fetch_commander_page_snapshot(slug: str) -> Optional[CommanderPageSnapshot]:
     commander_url = f"{EDHREC_BASE}/commanders/{slug}"
     try:
         html = await _fetch_text(commander_url)
@@ -453,7 +469,6 @@ async def try_fetch_commander_synergy(slug: str) -> Optional[Dict[str, Any]]:
         log.warning("Commander HTML fetch failed for slug %s", slug, exc_info=True)
         return None
 
-    header, description = _extract_title_description_from_head(html)
     html_tags = extract_commander_tags_from_html(html)
     build_id = extract_build_id_from_html(html)
     json_payload: Optional[Dict[str, Any]] = None
@@ -472,7 +487,25 @@ async def try_fetch_commander_synergy(slug: str) -> Optional[Dict[str, Any]]:
 
     tags = normalize_commander_tags(html_tags + json_tags)
 
-    buckets = _extract_commander_buckets(json_payload or {})
+    return CommanderPageSnapshot(
+        url=commander_url,
+        html=html,
+        tags=tags,
+        json_payload=json_payload,
+    )
+
+
+async def try_fetch_commander_synergy(
+    slug: str, *, snapshot: Optional[CommanderPageSnapshot] = None
+) -> Tuple[Optional[Dict[str, Any]], Optional[CommanderPageSnapshot]]:
+    if snapshot is None:
+        snapshot = await _fetch_commander_page_snapshot(slug)
+    if snapshot is None:
+        return None, None
+
+    header, description = _extract_title_description_from_head(snapshot.html)
+
+    buckets = _extract_commander_buckets(snapshot.json_payload or {})
     ordered_headers = _order_commander_headers(list(buckets.keys()))
     collections: List[ThemeCollection] = []
     for header_name in ordered_headers:
@@ -483,11 +516,11 @@ async def try_fetch_commander_synergy(slug: str) -> Optional[Dict[str, Any]]:
     page = PageTheme(
         header=header or f"{slug.replace('-', ' ').title()} | EDHREC",
         description=description or "",
-        tags=tags,
+        tags=snapshot.tags,
         container=ThemeContainer(collections=collections),
-        source_url=commander_url,
+        source_url=snapshot.url,
     )
-    return page.dict()
+    return page.dict(), snapshot
 
 
 async def http_get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -513,7 +546,9 @@ async def http_get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Op
 async def commander_summary_handler(name: str) -> Dict[str, Any]:
     display, slug, edhrec_url = normalize_commander_name(name)
 
-    data = await try_fetch_commander_synergy(slug=slug)
+    data, snapshot = await try_fetch_commander_synergy(slug=slug)
+    tags: List[str] = snapshot.tags if snapshot else []
+    source_url = snapshot.url if snapshot else edhrec_url
 
     if not _payload_has_collections(data):
         data = await http_get_json(
@@ -522,11 +557,17 @@ async def commander_summary_handler(name: str) -> Dict[str, Any]:
         )
 
     if not _payload_has_collections(data):
+        if not tags:
+            snapshot = snapshot or await _fetch_commander_page_snapshot(slug)
+            if snapshot:
+                tags = snapshot.tags
+                source_url = snapshot.url
         fallback_page = PageTheme(
             header=f"{display} | EDHREC",
             description="",
+            tags=tags,
             container=ThemeContainer(collections=[]),
-            source_url=edhrec_url,
+            source_url=source_url,
             error=f"Synergy unavailable for {display}",
         )
         return fallback_page.dict()
@@ -539,22 +580,33 @@ async def commander_summary_handler(name: str) -> Dict[str, Any]:
             data["container"] = container.dict()
         elif not isinstance(container, dict):
             data["container"] = {"collections": []}
-        tags_value = data.get("tags")
-        if isinstance(tags_value, list):
-            data["tags"] = normalize_commander_tags(tags_value)
-        elif isinstance(tags_value, str):
-            data["tags"] = normalize_commander_tags([tags_value])
-        else:
-            data["tags"] = []
-        data.setdefault("source_url", edhrec_url)
+        if not tags:
+            tags_value = data.get("tags")
+            if isinstance(tags_value, list):
+                tags = normalize_commander_tags(tags_value)
+            elif isinstance(tags_value, str):
+                tags = normalize_commander_tags([tags_value])
+            else:
+                snapshot = snapshot or await _fetch_commander_page_snapshot(slug)
+                if snapshot:
+                    tags = snapshot.tags
+                    source_url = snapshot.url
+        data["tags"] = tags
+        data.setdefault("source_url", source_url)
         return data
 
     # Final guard: coerce to PageTheme structure
+    if not tags:
+        snapshot = snapshot or await _fetch_commander_page_snapshot(slug)
+        if snapshot:
+            tags = snapshot.tags
+            source_url = snapshot.url
     page = PageTheme(
         header=f"{display} | EDHREC",
         description="",
+        tags=tags,
         container=ThemeContainer(collections=[]),
-        source_url=edhrec_url,
+        source_url=source_url,
     )
     return page.dict()
 
