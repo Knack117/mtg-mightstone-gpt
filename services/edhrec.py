@@ -267,7 +267,10 @@ def _fetch_commander_metadata(slug: str, session: requests.Session) -> Commander
                     json_tags = extract_commander_tags_from_json(payload)
                     sections = extract_commander_sections_from_json(payload)
 
-    tags = normalize_commander_tags(html_tags + json_tags)
+    if json_tags:
+        tags = normalize_commander_tags(json_tags)
+    else:
+        tags = normalize_commander_tags(html_tags)
     return CommanderMetadata(tags=tags, sections=sections)
 
 

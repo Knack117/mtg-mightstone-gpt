@@ -21,7 +21,6 @@ __all__ = [
 _BUILD_ID_RE = re.compile(r'"buildId"\s*:\s*"([^"]+)"')
 _TAG_HREF_RE = re.compile(r"/(?:tags|themes)/[a-z0-9\-]+", re.IGNORECASE)
 _TAG_SECTION_HEADING_RE = re.compile(r"^tags$", re.IGNORECASE)
-_TAG_KEY_RE = re.compile(r"(?:^|[_\-])(tags?|tagcloud|themes?)\b")
 _SECTION_KEY_MAP: Dict[str, str] = {
     "highsynergy": "High Synergy Cards",
     "highsynergycards": "High Synergy Cards",
@@ -32,6 +31,25 @@ _SECTION_KEY_MAP: Dict[str, str] = {
     "gamechanger": "Game Changers",
 }
 _MAX_TAG_LENGTH = 64
+_STRUCTURAL_TAG_NAMES = {
+    "themes",
+    "kindred",
+    "new cards",
+    "high synergy",
+    "high synergy cards",
+    "top cards",
+    "game changers",
+    "card types",
+    "creatures",
+    "instants",
+    "sorceries",
+    "utility artifacts",
+    "enchantments",
+    "planeswalkers",
+    "utility lands",
+    "mana artifacts",
+    "lands",
+}
 
 
 def extract_build_id_from_html(html: str) -> Optional[str]:
@@ -154,59 +172,93 @@ def extract_commander_tags_from_html(html: str) -> List[str]:
     return normalize_commander_tags(parser.tags)
 
 
-def _coerce_tag_candidate(value: Any) -> List[str]:
+def _collect_tag_entries(source: Any, *, treat_as_tag: bool) -> List[str]:
+    """Collect potential tag names from ``source``.
+
+    ``treat_as_tag`` indicates whether objects within ``source`` should be
+    interpreted as tag entries (e.g., dictionaries describing individual tags).
+    When ``False``, the walker only descends into known container keys (``tags``,
+    ``items`` ...). This keeps structural labels such as "Themes" or "Kindred"
+    from being captured as tags.
+    """
+
     tags: List[str] = []
-    if isinstance(value, str):
-        candidate = _clean_text(value)
-        if candidate:
-            tags.append(candidate)
+
+    if source is None:
         return tags
 
-    if isinstance(value, dict):
-        for key in ("name", "label", "title", "theme", "displayName"):
-            raw = value.get(key)
-            if isinstance(raw, str):
-                candidate = _clean_text(raw)
-                if candidate:
-                    tags.append(candidate)
-        for nested_key in ("tags", "themes", "items", "list", "entries"):
-            tags.extend(_coerce_tag_candidate(value.get(nested_key)))
+    if isinstance(source, str):
+        if treat_as_tag:
+            cleaned = _clean_text(source)
+            if cleaned:
+                tags.append(cleaned)
         return tags
 
-    if isinstance(value, (list, tuple, set)):
-        for item in value:
-            tags.extend(_coerce_tag_candidate(item))
+    if isinstance(source, (list, tuple, set)):
+        for item in source:
+            tags.extend(_collect_tag_entries(item, treat_as_tag=treat_as_tag))
+        return tags
+
+    if isinstance(source, dict):
+        if treat_as_tag:
+            for key in ("name", "label", "title", "displayName", "theme"):
+                raw = source.get(key)
+                if isinstance(raw, str):
+                    cleaned = _clean_text(raw)
+                    if cleaned:
+                        tags.append(cleaned)
+                    break
+
+        for key, value in source.items():
+            key_lower = key.lower() if isinstance(key, str) else ""
+            if key_lower in {"tags", "themes", "items", "list", "entries", "values", "chips"}:
+                tags.extend(_collect_tag_entries(value, treat_as_tag=True))
+            elif key_lower in {
+                "sections",
+                "groups",
+                "tabgroups",
+                "tabs",
+                "taggroups",
+                "collections",
+            }:
+                tags.extend(_collect_tag_entries(value, treat_as_tag=False))
+
         return tags
 
     return tags
 
 
+def _extract_commander_payload(payload: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return None
+
+    props = payload.get("props")
+    if isinstance(props, dict):
+        page_props = props.get("pageProps")
+        if isinstance(page_props, dict):
+            commander = page_props.get("commander")
+            if isinstance(commander, dict):
+                return commander
+    return None
+
+
 def extract_commander_tags_from_json(payload: Any) -> List[str]:
     """Return commander theme tags discovered in EDHREC Next.js payloads."""
 
-    if payload is None:
+    commander = _extract_commander_payload(payload)
+    if not commander:
         return []
 
     tags: List[str] = []
-    visited: Set[int] = set()
 
-    def walk(node: Any):
-        node_id = id(node)
-        if node_id in visited:
-            return
-        visited.add(node_id)
+    tags.extend(_collect_tag_entries(commander.get("themes"), treat_as_tag=True))
 
-        if isinstance(node, dict):
-            for key, value in node.items():
-                key_lower = key.lower() if isinstance(key, str) else ""
-                if _TAG_KEY_RE.search(key_lower or ""):
-                    tags.extend(_coerce_tag_candidate(value))
-                walk(value)
-        elif isinstance(node, (list, tuple, set)):
-            for item in node:
-                walk(item)
+    metadata = commander.get("metadata")
+    if isinstance(metadata, dict):
+        tag_cloud = metadata.get("tagCloud") or metadata.get("tag_cloud")
+        if tag_cloud:
+            tags.extend(_collect_tag_entries(tag_cloud, treat_as_tag=False))
 
-    walk(payload)
     return normalize_commander_tags(tags)
 
 
@@ -222,6 +274,8 @@ def normalize_commander_tags(values: Iterable[str]) -> List[str]:
         if len(cleaned) > _MAX_TAG_LENGTH:
             continue
         if not re.search(r"[A-Za-z]", cleaned):
+            continue
+        if cleaned.lower() in _STRUCTURAL_TAG_NAMES:
             continue
         key = cleaned.lower()
         if key in seen:

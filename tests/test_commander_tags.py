@@ -71,6 +71,80 @@ JSON_SAMPLE = {
 }
 
 
+JSON_SAMPLE_WITH_GROUPS = {
+    "props": {
+        "pageProps": {
+            "commander": {
+                "themes": [
+                    {"name": "Legendary Matters"},
+                ],
+                "metadata": {
+                    "tagCloud": {
+                        "tabs": [
+                            {"id": "themes", "name": "Themes"},
+                            {"id": "kindred", "name": "Kindred"},
+                        ],
+                        "sections": [
+                            {
+                                "name": "Themes",
+                                "tags": [
+                                    {"name": "Token Swarm"},
+                                ],
+                            },
+                            {
+                                "name": "Kindred",
+                                "tags": [
+                                    {"name": "Squirrel"},
+                                ],
+                            },
+                        ],
+                    }
+                },
+            }
+        }
+    }
+}
+
+
+JSON_SAMPLE_WITH_STRUCTURAL_NAMES = {
+    "props": {
+        "pageProps": {
+            "commander": {
+                "themes": [],
+                "metadata": {
+                    "tagCloud": {
+                        "tagGroups": [
+                            {
+                                "name": "Themes",
+                                "tags": [
+                                    {"name": "Token Swarm"},
+                                    {"label": "Go Wide"},
+                                ],
+                            },
+                            {
+                                "name": "Kindred",
+                                "items": [
+                                    {"name": "Squirrel"},
+                                ],
+                            },
+                        ],
+                        "groups": [
+                            {
+                                "name": "Card Types",
+                                "items": [
+                                    {"name": "Creatures"},
+                                    {"name": "Instants"},
+                                ],
+                            }
+                        ],
+                    }
+                },
+            }
+        }
+    }
+}
+
+
 def test_extract_commander_tags_from_html():
     tags = extract_commander_tags_from_html(HTML_SAMPLE)
     assert tags == ["Five-Color Goodstuff", "Ramp", "Legendary Matters"]
@@ -79,6 +153,16 @@ def test_extract_commander_tags_from_html():
 def test_extract_commander_tags_from_json():
     tags = extract_commander_tags_from_json(JSON_SAMPLE)
     assert tags == ["Legendary Matters", "Cascade Value", "Ramp", "Five-Color Goodstuff"]
+
+
+def test_extract_commander_tags_from_json_ignores_group_labels():
+    tags = extract_commander_tags_from_json(JSON_SAMPLE_WITH_GROUPS)
+    assert tags == ["Legendary Matters", "Token Swarm", "Squirrel"]
+
+
+def test_extract_commander_tags_from_json_filters_structural_names():
+    tags = extract_commander_tags_from_json(JSON_SAMPLE_WITH_STRUCTURAL_NAMES)
+    assert tags == ["Token Swarm", "Go Wide", "Squirrel"]
 
 
 def test_extract_commander_sections_from_json():
@@ -96,5 +180,7 @@ def test_normalize_commander_tags_deduplicates():
         "LEGENDARY MATTERS",
         "",
         "12345",
+        "Themes",
+        "Creatures",
     ])
     assert tags == ["Ramp", "Legendary Matters"]
