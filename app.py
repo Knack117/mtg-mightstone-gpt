@@ -16,6 +16,12 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from utils.commander_identity import normalize_commander_name
+from utils.edhrec_commander import (
+    extract_build_id_from_html,
+    extract_commander_tags_from_html,
+    extract_commander_tags_from_json,
+    normalize_commander_tags,
+)
 from services.edhrec import EdhrecError, fetch_average_deck
 from utils.identity import canonicalize_identity
 
@@ -122,6 +128,7 @@ class ThemeContainer(BaseModel):
 class PageTheme(BaseModel):
     header: str
     description: str
+    tags: List[str] = Field(default_factory=list)
     container: ThemeContainer
     source_url: Optional[str] = None
     error: Optional[str] = None
@@ -237,12 +244,6 @@ async def _fetch_json(url: str) -> Any:
 
 def _snakecase(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
-
-def _extract_build_id_from_html(html: str) -> Optional[str]:
-    m = _build_id_rx.search(html)
-    if m:
-        return m.group(1)
-    return None
 
 def _extract_title_description_from_head(html: str) -> Tuple[str, str]:
     title = ""
@@ -453,18 +454,23 @@ async def try_fetch_commander_synergy(slug: str) -> Optional[Dict[str, Any]]:
         return None
 
     header, description = _extract_title_description_from_head(html)
-    build_id = _extract_build_id_from_html(html)
+    html_tags = extract_commander_tags_from_html(html)
+    build_id = extract_build_id_from_html(html)
     json_payload: Optional[Dict[str, Any]] = None
+    json_tags: List[str] = []
 
     if build_id:
         json_url = f"{EDHREC_BASE}/_next/data/{build_id}/commanders/{slug}.json"
         try:
             json_payload = await _fetch_json(json_url)
+            json_tags = extract_commander_tags_from_json(json_payload) if json_payload else []
         except HTTPException:
             log.warning("Commander JSON fetch failed for slug %s", slug, exc_info=True)
             json_payload = None
     else:
         log.warning("No buildId discovered for commander slug %s", slug)
+
+    tags = normalize_commander_tags(html_tags + json_tags)
 
     buckets = _extract_commander_buckets(json_payload or {})
     ordered_headers = _order_commander_headers(list(buckets.keys()))
@@ -477,6 +483,7 @@ async def try_fetch_commander_synergy(slug: str) -> Optional[Dict[str, Any]]:
     page = PageTheme(
         header=header or f"{slug.replace('-', ' ').title()} | EDHREC",
         description=description or "",
+        tags=tags,
         container=ThemeContainer(collections=collections),
         source_url=commander_url,
     )
@@ -532,6 +539,13 @@ async def commander_summary_handler(name: str) -> Dict[str, Any]:
             data["container"] = container.dict()
         elif not isinstance(container, dict):
             data["container"] = {"collections": []}
+        tags_value = data.get("tags")
+        if isinstance(tags_value, list):
+            data["tags"] = normalize_commander_tags(tags_value)
+        elif isinstance(tags_value, str):
+            data["tags"] = normalize_commander_tags([tags_value])
+        else:
+            data["tags"] = []
         data.setdefault("source_url", edhrec_url)
         return data
 
@@ -555,7 +569,7 @@ async def _fetch_theme_resources(name: str, identity: str) -> Dict[str, Any]:
     html = await _fetch_text(tag_html_url)
     header, description = _extract_title_description_from_head(html)
 
-    build_id = _extract_build_id_from_html(html)
+    build_id = extract_build_id_from_html(html)
     if not build_id:
         json_url = f"{EDHREC_BASE}/_next/data/{'C2WISSDrnMBiFoK_iJlSk'}/tags/{tag_slug}/{color_slug}.json"
     else:
@@ -790,6 +804,7 @@ def edhrec_average_deck(
                 "bracket": bracket,
                 "source_url": source_url,
             },
+            "commander_tags": payload.get("commander_tags", []),
         },
         "error": None,
     }
