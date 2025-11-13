@@ -13,12 +13,12 @@ from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from edhrec import _slugify as _discover_slugify
 from edhrec import (
     find_average_deck_url,
     display_average_deck_bracket,
     normalize_average_deck_bracket,
 )
+from utils.commander_identity import commander_to_slug
 from utils.edhrec_commander import (
     extract_build_id_from_html,
     extract_commander_sections_from_json,
@@ -87,7 +87,7 @@ class EdhrecParsingError(EdhrecError):
 def slugify_commander(name: str) -> str:
     """Return the EDHREC slug for a commander name."""
 
-    return _discover_slugify(name or "")
+    return commander_to_slug(name or "")
 
 
 def average_deck_url(name: str, bracket: str = "upgraded") -> str:

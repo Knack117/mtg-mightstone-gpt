@@ -1,10 +1,8 @@
 # app.py
-import asyncio
 import json
 import logging
 import os
 import re
-import time
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -36,12 +34,6 @@ USER_AGENT = os.environ.get(
 )
 SCRYFALL_BASE = "https://api.scryfall.com"
 EDHREC_BASE = "https://edhrec.com"
-
-# Scryfall: be respectful; their docs suggest ~10 req/s cap. We’ll be far lower.
-SCRYFALL_MAX_CONCURRENCY = int(os.environ.get("SCRYFALL_MAX_CONCURRENCY", "4"))
-SCRYFALL_DELAY_SECONDS = float(os.environ.get("SCRYFALL_DELAY_SECONDS", "0.12"))  # ~8/s theoretical cap
-SCRYFALL_MAX_RETRIES = int(os.environ.get("SCRYFALL_MAX_RETRIES", "4"))
-SCRYFALL_CACHE_TTL_SECONDS = float(os.environ.get("SCRYFALL_CACHE_TTL_SECONDS", "3600"))
 
 logging.basicConfig(
     level=os.environ.get("LOGLEVEL", "INFO"),
@@ -176,8 +168,6 @@ default_headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/js
 async def on_startup():
     app.state.client = httpx.AsyncClient(timeout=http_timeout, headers=default_headers, http2=False)
     app.state.scryfall = httpx.AsyncClient(timeout=http_timeout, headers={"User-Agent": USER_AGENT}, http2=False)
-    app.state.sf_sem = asyncio.Semaphore(SCRYFALL_MAX_CONCURRENCY)
-    app.state.scryfall_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
     log.info("HTTP clients created.")
 
 @app.on_event("shutdown")
@@ -523,38 +513,12 @@ async def try_fetch_commander_synergy(
     return page.dict(), snapshot
 
 
-async def http_get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    try:
-        response = await app.state.client.get(url, params=params, follow_redirects=True)
-    except Exception:
-        log.warning("HTTP JSON fetch failed for %s", url, exc_info=True)
-        return None
-
-    if response.status_code != 200:
-        log.warning("HTTP JSON fetch %s returned status %s", url, response.status_code)
-        return None
-
-    try:
-        return response.json()
-    except json.JSONDecodeError:
-        log.warning("Invalid JSON payload from %s", url, exc_info=True)
-    except ValueError:
-        log.warning("Invalid JSON payload from %s", url, exc_info=True)
-    return None
-
-
 async def commander_summary_handler(name: str) -> Dict[str, Any]:
     display, slug, edhrec_url = normalize_commander_name(name)
 
     data, snapshot = await try_fetch_commander_synergy(slug=slug)
     tags: List[str] = snapshot.tags if snapshot else []
     source_url = snapshot.url if snapshot else edhrec_url
-
-    if not _payload_has_collections(data):
-        data = await http_get_json(
-            "https://mtg-mightstone-gpt.onrender.com/commander/summary",
-            params={"name": display},
-        )
 
     if not _payload_has_collections(data):
         if not tags:
@@ -673,116 +637,6 @@ async def fetch_theme_tag(name: str, identity: str) -> PageTheme:
         container=ThemeContainer(collections=collections),
         source_url=resources["tag_html_url"],
     )
-
-# -----------------------------------------------------------------------------
-# Helpers: Scryfall lookups (exact-name)
-# -----------------------------------------------------------------------------
-def _extract_image_url(card_data: Dict[str, Any], image_size: str) -> Optional[str]:
-    """Pull an image URL out of Scryfall card JSON for the requested size."""
-    if not image_size:
-        return None
-
-    iu = card_data.get("image_uris")
-    if isinstance(iu, dict) and image_size in iu:
-        return iu.get(image_size)
-
-    faces = card_data.get("card_faces")
-    if isinstance(faces, list):
-        for face in faces:
-            if not isinstance(face, dict):
-                continue
-            iu2 = face.get("image_uris")
-            if isinstance(iu2, dict) and image_size in iu2:
-                return iu2.get(image_size)
-    return None
-
-
-async def scryfall_named_exact(name: str, image_size: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns (scryfall_id, image_url_or_none) for an exact name match.
-    image_size: one of None | 'small' | 'normal' | 'large' | 'png' | 'art_crop' | 'border_crop'
-    """
-    cache: Dict[str, Tuple[float, Dict[str, Any]]] = getattr(app.state, "scryfall_cache", {})
-    key = name.strip().lower()
-    now = time.monotonic()
-
-    # Cache hit?
-    if key in cache:
-        cached_at, cached_payload = cache[key]
-        if now - cached_at <= SCRYFALL_CACHE_TTL_SECONDS and cached_payload:
-            sid = cached_payload.get("id")
-            img_url = _extract_image_url(cached_payload, image_size) if image_size else None
-            return sid, img_url
-        # Drop stale / empty cache entries
-        if now - cached_at > SCRYFALL_CACHE_TTL_SECONDS:
-            cache.pop(key, None)
-
-    # Guard: Scryfall exact match wants printable names; leave quotes out, we’ll use url params.
-    params = {"exact": name}
-    url = f"{SCRYFALL_BASE}/cards/named"
-    backoff = SCRYFALL_DELAY_SECONDS
-
-    for attempt in range(SCRYFALL_MAX_RETRIES):
-        async with app.state.sf_sem:
-            r = await app.state.scryfall.get(url, params=params)
-            # polite spacing regardless of outcome
-            await asyncio.sleep(SCRYFALL_DELAY_SECONDS)
-
-        if r.status_code == 200:
-            data = r.json()
-            cache[key] = (time.monotonic(), data)
-            sid = data.get("id")
-            img_url = _extract_image_url(data, image_size) if image_size else None
-            return sid, img_url
-
-        if r.status_code in (429,) or 500 <= r.status_code < 600:
-            retry_after_header = r.headers.get("Retry-After")
-            if retry_after_header:
-                try:
-                    retry_delay = float(retry_after_header)
-                except ValueError:
-                    retry_delay = backoff
-            else:
-                retry_delay = backoff
-            log.warning(
-                "Scryfall exact lookup retry %s/%s for %r (status %s)",
-                attempt + 1,
-                SCRYFALL_MAX_RETRIES,
-                name,
-                r.status_code,
-            )
-            await asyncio.sleep(retry_delay)
-            backoff = min(backoff * 2, 5.0)
-            continue
-
-        log.warning(
-            "Scryfall exact lookup failed for %r: %s %s", name, r.status_code, r.text[:200]
-        )
-        break
-
-    return None, None
-
-async def hydrate_items(
-    items: List[ThemeItem],
-    include_images: bool,
-    image_size: str,
-) -> List[ThemeItem]:
-    """
-    Hydrates missing Scryfall IDs (and optional images) for a list of ThemeItem.
-    """
-    async def hydrate_one(it: ThemeItem) -> ThemeItem:
-        if it.id and (not include_images or it.image):
-            return it
-        sid, img = await scryfall_named_exact(it.name, image_size if include_images else None)
-        if sid:
-            it.id = sid
-        if include_images and img:
-            it.image = img
-        return it
-
-    # Keep order stable
-    tasks = [hydrate_one(it) for it in items]
-    return await asyncio.gather(*tasks)
 
 # -----------------------------------------------------------------------------
 # Routes
@@ -947,48 +801,6 @@ async def edhrec_theme_nextdebug(
     }
 
     return JSONResponse(content=debug_payload)
-
-@app.get("/edhrec/theme_hydrated", response_model=PageTheme)
-async def edhrec_theme_hydrated(
-    name: str = Query(..., description="EDHREC tag/theme name, e.g. 'prowess'"),
-    identity: str = Query(..., description="Color identity (e.g., 'wur' -> Jeskai)"),
-    include_images: bool = Query(False, description="If true, also return Scryfall image URLs"),
-    image_size: str = Query("normal", description="Scryfall image size if include_images=true (small|normal|large|png|art_crop|border_crop)"),
-    max_to_hydrate: int = Query(350, ge=1, le=1000, description="Upper bound on total items to hydrate for safety"),
-):
-    """
-    Same as /edhrec/theme, but fills in missing Scryfall IDs (and optionally images) by exact-name lookup.
-    Default keeps bandwidth small by *not* including images (set include_images=true to receive them).
-    """
-    theme = await edhrec_theme(name=name, identity=identity)  # reuse above
-
-    # Gather all items (respect a max just in case pages explode)
-    all_items: List[ThemeItem] = []
-    for col in theme.container.collections:
-        all_items.extend(col.items)
-    slice_items = all_items[:max_to_hydrate]
-
-    hydrated_map: Dict[Tuple[str, Optional[str]], ThemeItem] = {}
-
-    # Hydrate only those missing an id or (if requested) missing an image
-    to_hydrate: List[ThemeItem] = []
-    for it in slice_items:
-        need = (it.id is None) or (include_images and it.image is None)
-        if need:
-            to_hydrate.append(it)
-
-    if to_hydrate:
-        hydrated_items = await hydrate_items(to_hydrate, include_images=include_images, image_size=image_size)
-        # Put them back into the original collections (objects are mutated, but we’re explicit)
-        idx = 0
-        for col in theme.container.collections:
-            for i, it in enumerate(col.items):
-                if idx < len(slice_items) and it is slice_items[idx]:
-                    # If this item was in the hydrated set, it was mutated in place by gather().
-                    pass
-                idx += 1
-
-    return theme
 
 @app.get("/cards/search")
 async def cards_search(

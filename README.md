@@ -1,7 +1,7 @@
 Mightstone GPT Webservice
 
 FastAPI microservice that powers a Commander/EDH deckbuilding GPT with Scryfall lookups and EDHREC theme/tag ingestion.
-It exposes clean, rate-limited endpoints your custom GPT (or any client) can call to fetch theme data (e.g., Jeskai Prowess) and hydrate it with Scryfall IDs (and optionally images).
+It exposes clean, rate-limited endpoints your custom GPT (or any client) can call to fetch theme data (e.g., Jeskai Prowess) and perform Scryfall searches for supporting cards.
 
 ✨ Features
 
@@ -15,9 +15,6 @@ Pulls data from EDHREC Tag pages (e.g. /tags/prowess/jeskai) via their Next.js d
 }
 
 
-Hydration with Scryfall IDs
-Bulk fills in missing Scryfall UUIDs (and, optionally, image URLs) by exact-name matching.
-
 Polite, configurable rate-limiting to respect Scryfall (low concurrency + small per-request delay by default).
 
 Simple Scryfall search proxy for debugging and client hydration.
@@ -25,15 +22,15 @@ Simple Scryfall search proxy for debugging and client hydration.
 Works great with a GPT Action: predictable schemas, no brittle HTML scraping on the client.
 
 Endpoints
-Method	Path	Purpose
-GET	/health	Service health check.
-GET	/edhrec/theme	Fetch EDHREC tag page for a theme & color identity (e.g. prowess + wur → Jeskai).
-GET	/edhrec/theme_nextdebug	Return the raw EDHREC tag payload for debugging a theme query.
-GET	/edhrec/theme_hydrated	Same as /edhrec/theme, then hydrates items with Scryfall IDs (and optionally images).
-GET	/cards/search	Thin pass-through to Scryfall’s /cards/search for debugging/hydration.
-GET	/edhrec/average-deck	Fetch EDHREC “Average Deck” list for a commander (all or bracketed lists).
-(optional)	/docs	FastAPI Swagger UI (auto-generated).
-(optional)	/openapi.json	FastAPI OpenAPI spec (auto-generated).
+Method | Path | Purpose
+---|---|---
+GET | /health | Service health check.
+GET | /edhrec/theme | Fetch EDHREC tag page for a theme & color identity (e.g. prowess + wur → Jeskai).
+GET | /edhrec/theme_nextdebug | Return the raw EDHREC tag payload for debugging a theme query.
+GET | /cards/search | Thin pass-through to Scryfall’s /cards/search for debugging/hydration.
+GET | /edhrec/average-deck | Fetch EDHREC “Average Deck” list for a commander (all or bracketed lists).
+(optional) | /docs | FastAPI Swagger UI (auto-generated).
+(optional) | /openapi.json | FastAPI OpenAPI spec (auto-generated).
 
 Note: The service targets EDHREC Tag pages like /tags/prowess/jeskai. That’s the most stable structure for extracting theme data. If you need /themes/... pages, open an issue and we can extend the extractor.
 
@@ -51,10 +48,6 @@ Environment variables (sensible defaults baked in):
 PORT — default 8080
 
 MIGHTSTONE_UA — default Mightstone-GPT/1.0 (+https://mtg-mightstone-gpt.onrender.com)
-
-SCRYFALL_MAX_CONCURRENCY — default 4
-
-SCRYFALL_DELAY_SECONDS — default 0.12 (slows to ~8 req/s theoretical)
 
 3) Run
 uvicorn app:app --host 0.0.0.0 --port 8080
@@ -98,19 +91,6 @@ curl -sG "http://localhost:8080/edhrec/theme_nextdebug" \
   --data-urlencode "name=totally-made-up-theme" \
   --data-urlencode "identity=wur" -w "\nHTTP %{http_code}\n"
 
-Hydrated Theme (adds Scryfall IDs, optional images)
-# No images (default) – best for GPT/tooling
-curl -sG "http://localhost:8080/edhrec/theme_hydrated" \
-  --data-urlencode "name=prowess" \
-  --data-urlencode "identity=wur" | jq .
-
-# With images (opt-in)
-curl -sG "http://localhost:8080/edhrec/theme_hydrated" \
-  --data-urlencode "name=prowess" \
-  --data-urlencode "identity=wur" \
-  --data-urlencode "include_images=true" \
-  --data-urlencode "image_size=normal" | jq .
-
 Scryfall Search (debug)
 curl -sG "http://localhost:8080/cards/search" \
   --data-urlencode 'q=! "Monastery Mentor"' \
@@ -130,11 +110,11 @@ Returns the unshaped Next.js payload straight from EDHREC for troubleshooting th
 **HTTP Endpoint**
 
 ```
-GET /edhrec/average-deck?name=<Commander Name>&bracket=<precon|upgraded>
+GET /edhrec/average-deck?name=<Commander Name>&bracket=<bracket>
 ```
 
 - `name`: commander’s printed name (e.g., `Jodah, the Unifier`).
-- `bracket` (optional): defaults to `upgraded`. Accepts `precon` or `upgraded`.
+- `bracket` (optional): defaults to `upgraded`. Accepts any supported EDHREC bracket (precon/exhibition, core, upgraded, optimized, cedh, etc.).
 
 **Response Shape**
 
@@ -200,17 +180,6 @@ identity (required) — Color identity:
 - Codes are canonicalized to W→U→B→R→G order.
 - Slugs map to EDHREC color words (e.g., mono-black, izzet, witch-maw).
 
-/edhrec/theme_hydrated
-
-Includes all /edhrec/theme params plus:
-
-include_images (bool, default false) — When true, returns Scryfall image URLs.
-
-image_size (default normal) — One of small | normal | large | png | art_crop | border_crop.
-
-max_to_hydrate (int, default 350) — Upper bound on items to hydrate for safety.
-
-Tip: Your custom GPT doesn’t need images to reason; name + id is sufficient. Images are for UI polish.
 
 How It Works (High Level)
 
@@ -272,7 +241,6 @@ Expected sometimes. The service falls back to the public Next.js data route unde
 
 Scryfall rate limiting
 
-Tune SCRYFALL_MAX_CONCURRENCY and SCRYFALL_DELAY_SECONDS if you hydrate tons of items.
 
 Be considerate—Scryfall is a free community resource.
 

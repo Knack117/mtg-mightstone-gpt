@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import re
 import time
-import unicodedata
 from typing import Dict, Optional, Set, Tuple
 from urllib.parse import quote_plus
 
 import requests
+
+from utils.commander_identity import commander_slug_candidates
 
 UA = "MightstoneBot/1.0 (+https://github.com/Knack117/mtg-mightstone-gpt)"
 
@@ -51,35 +52,6 @@ _AVERAGE_DECK_BRACKET_ALIASES = {
     "cedh/expensive": "cedh/expensive",
     "cedh-expensive": "cedh/expensive",
 }
-
-
-def _strip_accents(text: str) -> str:
-    """Return *text* lowercased with accents removed."""
-
-    normalized = unicodedata.normalize("NFKD", text or "")
-    return "".join(char for char in normalized if not unicodedata.combining(char))
-
-
-def _slugify(name: str) -> str:
-    """Create an EDHREC-style slug for *name*."""
-
-    slug = (name or "").strip()
-    slug = slug.replace(" // ", " - ").replace("//", " - ")
-    slug = _strip_accents(slug.lower())
-    slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
-    return re.sub(r"-+", "-", slug)
-
-
-def _partner_orders(name: str) -> list[str]:
-    """Return all partner orderings for *name*."""
-
-    normalized = (name or "").replace(" - ", " // ")
-    if "//" not in normalized:
-        return [name]
-    first, second = [piece.strip() for piece in normalized.split("//", 1)]
-    return [f"{first} // {second}", f"{second} // {first}"]
-
-
 def _get(session: requests.Session, url: str, retries: int = 2) -> requests.Response:
     """Perform a GET with lightweight retry handling."""
 
@@ -104,8 +76,7 @@ def _fetch_html(session: requests.Session, url: str) -> str:
 def _find_commander_page(session: requests.Session, name: str) -> Optional[str]:
     """Return the EDHREC commander page for *name* if one exists."""
 
-    for variant in _partner_orders(name or ""):
-        slug = _slugify(variant)
+    for slug in commander_slug_candidates(name or ""):
         if not slug:
             continue
         url = f"https://edhrec.com/commanders/{slug}"
@@ -191,8 +162,7 @@ def find_average_deck_url(
                 }
             )
 
-    for variant in _partner_orders(name or ""):
-        slug = _slugify(variant)
+    for slug in commander_slug_candidates(name or ""):
         if not slug:
             continue
         if normalized_bracket:
