@@ -75,6 +75,13 @@ def _clean_text(value: str) -> str:
     return cleaned.strip()
 
 
+def _has_class_prefix(value: Optional[str], prefix: str) -> bool:
+    if not value:
+        return False
+    classes = [part.strip() for part in value.split() if part.strip()]
+    return any(cls.startswith(prefix) for cls in classes)
+
+
 class _CommanderTagParser(HTMLParser):
     """Simple HTML parser that captures anchor text for commander tag links."""
 
@@ -149,6 +156,31 @@ def extract_commander_tags_from_html(html: str) -> List[str]:
         return []
 
     soup = BeautifulSoup(html, "html.parser")
+
+    # New layout: Tags rendered within the navigation panel tag cloud
+    nav_panel = soup.find(
+        "div",
+        class_=lambda value: _has_class_prefix(value, "NavigationPanel_tags__"),
+    )
+    if nav_panel:
+        nav_tags: List[str] = []
+        anchors = nav_panel.find_all(
+            "a",
+            class_=lambda value: _has_class_prefix(value, "LinkHelper_container__"),
+        )
+        for anchor in anchors:
+            if not _looks_like_tag_href(anchor.get("href")):
+                continue
+            label = anchor.find(
+                "span",
+                class_=lambda value: _has_class_prefix(value, "NavigationPanel_label__"),
+            )
+            text_source = label or anchor
+            text = _clean_text(text_source.get_text(" ") if text_source else "")
+            if text:
+                nav_tags.append(text)
+        if nav_tags:
+            return normalize_commander_tags(nav_tags)
 
     # Prefer anchors contained within the explicit "Tags" section if available.
     section_tags: List[str] = []

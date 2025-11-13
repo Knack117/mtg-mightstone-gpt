@@ -14,15 +14,24 @@ from utils.edhrec_commander import (
 
 
 HTML_SAMPLE = """
+<div class="NavigationPanel_tags__M9VjI">
+  <a class="LinkHelper_container__tiM9S" href="/themes/five-color-goodstuff">
+    <span class="NavigationPanel_label__xMLz1">Five-Color Goodstuff</span>
+  </a>
+  <a class="LinkHelper_container__tiM9S" href="/tags/ramp/naya">
+    <span class="NavigationPanel_label__xMLz1">Ramp</span>
+  </a>
+  <a class="LinkHelper_container__tiM9S" href="https://edhrec.com/tags/legendary-matters">
+    <span class="NavigationPanel_label__xMLz1">Legendary Matters</span>
+  </a>
+  <a class="LinkHelper_container__tiM9S" href="/average-decks/jodah-the-unifier/upgraded">
+    <span class="NavigationPanel_label__xMLz1">Ignore me</span>
+  </a>
+</div>
 <section>
   <h2>Tags</h2>
   <div class="commander-tags">
-    <a class="chip" href="/themes/five-color-goodstuff">Five-Color Goodstuff</a>
-    <a href="/tags/ramp/naya">Ramp</a>
-    <span>
-      <a href="/average-decks/jodah-the-unifier/upgraded">Ignore me</a>
-    </span>
-    <a href="https://edhrec.com/tags/legendary-matters">Legendary Matters</a>
+    <a class="chip" href="/themes/five-color-goodstuff">Should be ignored</a>
   </div>
 </section>
 <section>
