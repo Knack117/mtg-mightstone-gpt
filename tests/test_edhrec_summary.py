@@ -203,6 +203,63 @@ def test_fetch_commander_summary_reads_navigation_panel_tags():
     assert tags_by_name["Mutant"]["deck_count"] == 250
 
 
+def test_fetch_commander_summary_handles_nested_tag_entries():
+    name = "Ezuri, Claw of Progress"
+    slug = "ezuri-claw-of-progress"
+    url = f"https://edhrec.com/commanders/{slug}"
+
+    next_data = {
+        "props": {
+            "pageProps": {
+                "commander": {
+                    "metadata": {
+                        "tagCloud": {
+                            "groups": [
+                                {
+                                    "tags": [
+                                        {
+                                            "tag": {"name": "+1/+1 Counters"},
+                                            "deckCount": 980,
+                                        },
+                                        {
+                                            "theme": {"title": "Mutate"},
+                                            "deckCount": 430,
+                                        },
+                                    ]
+                                }
+                            ]
+                        }
+                    },
+                    "themes": [
+                        {"tag": {"name": "Energy"}},
+                        {"tag": {"label": "Counters"}},
+                    ],
+                },
+                "data": {"container": {"json_dict": {"cardlists": []}}},
+            }
+        }
+    }
+
+    html = f"""
+    <html>
+      <body>
+        <script id=\"__NEXT_DATA__\" type=\"application/json\">{json.dumps(next_data)}</script>
+      </body>
+    </html>
+    """
+
+    session = DummySession({url: DummyResponse(html)})
+
+    summary = edhrec.fetch_commander_summary(name, session=session)
+
+    tag_names = [entry["name"] for entry in summary["tags"]]
+    assert tag_names == ["+1/+1 Counters", "Mutate", "Energy", "Counters"]
+    counts = {entry["name"]: entry["deck_count"] for entry in summary["tags"]}
+    assert counts["+1/+1 Counters"] == 980
+    assert counts["Mutate"] == 430
+    assert summary["top_tags"][0]["name"] == "+1/+1 Counters"
+
+
 def test_fetch_commander_summary_handles_missing_tag_counts():
     name = "Kibo, Uktabi Prince"
     slug = "kibo-uktabi-prince"

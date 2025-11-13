@@ -154,6 +154,37 @@ JSON_SAMPLE_WITH_STRUCTURAL_NAMES = {
 }
 
 
+JSON_SAMPLE_WITH_NESTED_TAGS = {
+    "props": {
+        "pageProps": {
+            "commander": {
+                "themes": [
+                    {"tag": {"name": "Energy"}},
+                    {"tag": {"label": "Counters"}},
+                ],
+                "metadata": {
+                    "tagCloud": {
+                        "groups": [
+                            {
+                                "tags": [
+                                    {
+                                        "tag": {"name": "+1/+1 Counters"},
+                                        "deckCount": 1200,
+                                    },
+                                    {
+                                        "theme": {"title": "Mutate"},
+                                    },
+                                ]
+                            }
+                        ]
+                    }
+                },
+            }
+        }
+    }
+}
+
+
 def test_extract_commander_tags_from_html():
     tags = extract_commander_tags_from_html(HTML_SAMPLE)
     assert tags == ["Five-Color Goodstuff", "Ramp", "Legendary Matters"]
@@ -172,6 +203,11 @@ def test_extract_commander_tags_from_json_ignores_group_labels():
 def test_extract_commander_tags_from_json_filters_structural_names():
     tags = extract_commander_tags_from_json(JSON_SAMPLE_WITH_STRUCTURAL_NAMES)
     assert tags == ["Token Swarm", "Go Wide", "Squirrel"]
+
+
+def test_extract_commander_tags_from_json_handles_nested_tag_field():
+    tags = extract_commander_tags_from_json(JSON_SAMPLE_WITH_NESTED_TAGS)
+    assert tags == ["Energy", "Counters", "+1/+1 Counters", "Mutate"]
 
 
 def test_extract_commander_sections_from_json():
