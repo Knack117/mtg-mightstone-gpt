@@ -162,6 +162,47 @@ def test_fetch_commander_summary_parses_sections_and_tags():
     assert top_tag["deck_count"] == 1234
 
 
+def test_fetch_commander_summary_reads_navigation_panel_tags():
+    name = "Heroes in a Half Shell"
+    slug = "heroes-in-a-half-shell"
+    url = f"https://edhrec.com/commanders/{slug}"
+
+    next_data = {
+        "props": {
+            "pageProps": {
+                "commander": {},
+                "data": {"container": {"json_dict": {"cardlists": []}}},
+            }
+        }
+    }
+
+    html = f"""
+    <html>
+      <body>
+        <div class=\"NavigationPanel_tags__abc\">
+          <a class=\"LinkHelper_container__tag btn btn-sm btn-secondary\" href=\"/tags/ninjas\">
+            <span class=\"NavigationPanel_label__abc\">Ninjas</span>
+            <span class=\"badge bg-light\">1.5k</span>
+          </a>
+          <a class=\"LinkHelper_container__tag btn btn-sm btn-secondary\" href=\"/themes/mutant\">
+            <span class=\"NavigationPanel_label__abc\">Mutant</span>
+            <span class=\"badge bg-light\">250</span>
+          </a>
+        </div>
+        <script id=\"__NEXT_DATA__\" type=\"application/json\">{json.dumps(next_data)}</script>
+      </body>
+    </html>
+    """
+
+    session = DummySession({url: DummyResponse(html)})
+
+    summary = edhrec.fetch_commander_summary(name, session=session)
+
+    tags_by_name = {tag["name"]: tag for tag in summary["tags"]}
+    assert tags_by_name["Ninjas"]["deck_count"] == 1500
+    assert tags_by_name["Mutant"]["deck_count"] == 250
+
+
 def test_fetch_commander_summary_handles_missing_tag_counts():
     name = "Kibo, Uktabi Prince"
     slug = "kibo-uktabi-prince"

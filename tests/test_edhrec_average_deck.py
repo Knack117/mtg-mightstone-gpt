@@ -74,6 +74,37 @@ def test_display_average_deck_bracket(value, expected):
     assert display_average_deck_bracket(value) == expected
 
 
+def test_find_average_deck_url_falls_back_to_all():
+    from edhrec import commander_slug_candidates
+
+    class DummyResponse:
+        def __init__(self, text: str = "", status_code: int = 200):
+            self.text = text
+            self.status_code = status_code
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise requests.HTTPError(f"HTTP {self.status_code}")
+
+    class DummySession:
+        def __init__(self, responses):
+            self.responses = responses
+
+        def get(self, url, headers=None, timeout=None):
+            return self.responses.get(url, DummyResponse(status_code=404))
+
+    slug_iter = (slug for slug in commander_slug_candidates("Heroes in a Half Shell") if slug)
+    commander_slug = next(slug_iter)
+    commander_url = f"https://edhrec.com/commanders/{commander_slug}"
+    html = f'<a href="/average-decks/{commander_slug}">Average</a>'
+    session = DummySession({commander_url: DummyResponse(text=html)})
+
+    result = find_average_deck_url(session, "Heroes in a Half Shell", "optimized")
+
+    assert result["source_url"] == f"https://edhrec.com/average-decks/{commander_slug}"
+    assert "all" in result["available_brackets"]
+
+
 @pytest.mark.parametrize(
     "name, bracket",
     [
