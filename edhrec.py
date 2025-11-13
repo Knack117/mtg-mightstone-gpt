@@ -139,6 +139,7 @@ def _pick_avg_link(html: str, bracket: str) -> Optional[Dict[str, Set[str] | Opt
 
     normalized_links: list[Tuple[str, str]] = []
     buckets: Set[str] = set()
+    fallback_all: Optional[str] = None
 
     for path in links:
         match = _AVERAGE_DECK_PATH_RE.match(path)
@@ -151,6 +152,8 @@ def _pick_avg_link(html: str, bracket: str) -> Optional[Dict[str, Set[str] | Opt
             continue
         normalized_links.append((path, normalized))
         buckets.add(display_average_deck_bracket(normalized))
+        if normalized == "":
+            fallback_all = path
 
     if not normalized_links:
         return None
@@ -161,6 +164,12 @@ def _pick_avg_link(html: str, bracket: str) -> Optional[Dict[str, Set[str] | Opt
                 "url": f"https://edhrec.com{path}",
                 "available": buckets,
             }
+
+    if bracket and fallback_all and "all" in buckets:
+        return {
+            "url": f"https://edhrec.com{fallback_all}",
+            "available": buckets,
+        }
 
     return {"url": None, "available": buckets}
 

@@ -772,6 +772,45 @@ def _extract_tags_with_counts_from_html(html: str) -> List[Dict[str, Any]]:
             return
         merged[key] = {"name": normalized, "deck_count": count if isinstance(count, int) else None}
 
+    def _class_list(value: Any) -> List[str]:
+        if not value:
+            return []
+        if isinstance(value, str):
+            return [part for part in value.split() if part]
+        if isinstance(value, (list, tuple, set)):
+            return [str(part) for part in value if isinstance(part, str) and part]
+        return []
+
+    nav_panel = soup.find(
+        "div",
+        class_=lambda value: any(cls.startswith("NavigationPanel_tags__") for cls in _class_list(value)),
+    )
+    if nav_panel:
+        anchors = nav_panel.find_all("a", href=True)
+        for anchor in anchors:
+            href = anchor.get("href", "")
+            if not _TAG_LINK_RE.search(href or ""):
+                continue
+            label_node = anchor.find(
+                "span",
+                class_=lambda value: any(
+                    cls.startswith("NavigationPanel_label__") for cls in _class_list(value)
+                ),
+            )
+            raw_name = label_node.get_text(" ", strip=True) if label_node else anchor.get_text(" ", strip=True)
+            name, inline_count = _split_tag_name_and_count(raw_name)
+            count_node = anchor.find(
+                "span",
+                class_=lambda value: (
+                    any(cls.startswith("badge") for cls in _class_list(value))
+                    or any(cls.startswith("NavigationPanel_count__") for cls in _class_list(value))
+                ),
+            )
+            count = _parse_count(count_node.get_text(" ", strip=True)) if count_node else None
+            if count is None:
+                count = inline_count
+            record(name, count)
+
     for anchor in soup.find_all("a", href=True):
         href = anchor.get("href", "")
         if not _TAG_LINK_RE.search(href or ""):
