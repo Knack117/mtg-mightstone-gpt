@@ -1,6 +1,6 @@
 {
   "name": "edhrec_average_deck",
-  "description": "Fetch EDHREC Average Deck for a commander (all/exhibition/core/upgraded/optimized/cedh).",
+  "description": "Fetch EDHREC Average Deck for a commander (all/exhibition[/budget|/expensive]/core/upgraded/optimized/cedh[/budget|/expensive]).",
   "parameters": {
     "type": "object",
     "properties": {
@@ -11,7 +11,23 @@
       "bracket": {
         "type": "string",
         "description": "Bracket (name or 1..5)",
-        "enum": ["all", "exhibition", "core", "upgraded", "optimized", "cedh", "1", "2", "3", "4", "5"],
+        "enum": [
+          "all",
+          "exhibition",
+          "exhibition/budget",
+          "exhibition/expensive",
+          "core",
+          "upgraded",
+          "optimized",
+          "cedh",
+          "cedh/budget",
+          "cedh/expensive",
+          "1",
+          "2",
+          "3",
+          "4",
+          "5"
+        ],
         "default": "all"
       }
     },

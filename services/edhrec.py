@@ -14,9 +14,14 @@ import requests
 from bs4 import BeautifulSoup
 
 from edhrec import _slugify as _discover_slugify
-from edhrec import find_average_deck_url
+from edhrec import (
+    find_average_deck_url,
+    display_average_deck_bracket,
+    normalize_average_deck_bracket,
+)
 from utils.edhrec_commander import (
     extract_build_id_from_html,
+    extract_commander_sections_from_json,
     extract_commander_tags_from_html,
     extract_commander_tags_from_json,
     normalize_commander_tags,
@@ -44,6 +49,12 @@ _HEADERS = {
 }
 
 _CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
+
+
+@dataclass
+class CommanderMetadata:
+    tags: List[str]
+    sections: Dict[str, List[str]]
 
 
 class EdhrecError(RuntimeError):
@@ -83,12 +94,14 @@ def average_deck_url(name: str, bracket: str = "upgraded") -> str:
     """Return the EDHREC average deck URL for a commander and bracket."""
 
     slug = slugify_commander(name)
-    normalized_bracket = (bracket or "upgraded").strip().lower()
-    return f"https://edhrec.com/average-decks/{slug}/{normalized_bracket}"
+    normalized_bracket = normalize_average_deck_bracket(bracket)
+    if normalized_bracket:
+        return f"https://edhrec.com/average-decks/{slug}/{normalized_bracket}"
+    return f"https://edhrec.com/average-decks/{slug}"
 
 
 def _cache_key(slug: str, bracket: str) -> Tuple[str, str]:
-    return slug, (bracket or "upgraded").strip().lower()
+    return slug, (bracket or "")
 
 
 def _request_average_deck(url: str, session: Optional[requests.Session] = None) -> str:
@@ -125,7 +138,9 @@ def _request_average_deck(url: str, session: Optional[requests.Session] = None) 
     raise last_exc
 
 
-_AVERAGE_DECK_PATH_RE = re.compile(r"^/average-decks/([a-z0-9\-]+)/([a-z0-9\-]+)$")
+_AVERAGE_DECK_PATH_RE = re.compile(
+    r"^/average-decks/([a-z0-9\-]+)(?:/([a-z0-9\-]+)(?:/([a-z0-9\-]+))?)?$"
+)
 
 
 def _normalize_average_deck_url(url: str) -> Tuple[str, str, str]:
@@ -148,9 +163,13 @@ def _normalize_average_deck_url(url: str) -> Tuple[str, str, str]:
     if not match:
         raise ValueError("source_url must be an EDHREC average-decks URL")
 
-    slug, bracket = match.groups()
-    normalized_bracket = bracket.lower()
-    normalized_url = f"https://edhrec.com/average-decks/{slug}/{normalized_bracket}"
+    slug = match.group(1)
+    bracket_parts = [part for part in match.groups()[1:] if part]
+    raw_bracket = "/".join(bracket_parts)
+    normalized_bracket = normalize_average_deck_bracket(raw_bracket)
+    normalized_url = f"https://edhrec.com/average-decks/{slug}"
+    if normalized_bracket:
+        normalized_url += f"/{normalized_bracket}"
     return normalized_url, slug, normalized_bracket
 
 
@@ -161,13 +180,19 @@ def _fetch_average_deck_payload(
     session: Optional[requests.Session] = None,
     source_url: Optional[str] = None,
 ) -> Dict[str, Any]:
-    key = _cache_key(slug, bracket)
+    normalized_bracket = normalize_average_deck_bracket(bracket)
+    key = _cache_key(slug, normalized_bracket)
     now = time.time()
     cached = _CACHE.get(key)
     if cached and now - cached[0] < CACHE_TTL_SECONDS:
         return json.loads(json.dumps(cached[1]))
 
-    url = source_url or f"https://edhrec.com/average-decks/{slug}/{(bracket or 'upgraded').strip().lower()}"
+    if source_url:
+        url = source_url
+    else:
+        url = f"https://edhrec.com/average-decks/{slug}"
+        if normalized_bracket:
+            url += f"/{normalized_bracket}"
     html = _request_average_deck(url, session=session)
     payload = _find_next_data(html, url)
     cards = _find_cards_in_payload(payload, url)
@@ -184,30 +209,47 @@ def _fetch_average_deck_payload(
 
     result = {
         "source_url": url,
-        "bracket": (bracket or "upgraded").strip().lower(),
+        "bracket": normalized_bracket,
         "cards": normalized_cards,
     }
     _CACHE[key] = (now, json.loads(json.dumps(result)))
     return json.loads(json.dumps(result))
 
 
-def _fetch_commander_tags(slug: str, session: requests.Session) -> List[str]:
+def _fetch_commander_metadata(slug: str, session: requests.Session) -> CommanderMetadata:
     if not slug:
-        return []
+        return CommanderMetadata(tags=[], sections={
+            "High Synergy Cards": [],
+            "Top Cards": [],
+            "Game Changers": [],
+        })
 
     commander_url = f"https://edhrec.com/commanders/{slug}"
     try:
         response = session.get(commander_url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
     except requests.RequestException:
-        return []
+        return CommanderMetadata(tags=[], sections={
+            "High Synergy Cards": [],
+            "Top Cards": [],
+            "Game Changers": [],
+        })
 
     if response.status_code != 200:
-        return []
+        return CommanderMetadata(tags=[], sections={
+            "High Synergy Cards": [],
+            "Top Cards": [],
+            "Game Changers": [],
+        })
 
     html = response.text
     html_tags = extract_commander_tags_from_html(html)
     build_id = extract_build_id_from_html(html)
     json_tags: List[str] = []
+    sections: Dict[str, List[str]] = {
+        "High Synergy Cards": [],
+        "Top Cards": [],
+        "Game Changers": [],
+    }
 
     if build_id:
         json_url = f"https://edhrec.com/_next/data/{build_id}/commanders/{slug}.json"
@@ -223,8 +265,10 @@ def _fetch_commander_tags(slug: str, session: requests.Session) -> List[str]:
                     payload = None
                 else:
                     json_tags = extract_commander_tags_from_json(payload)
+                    sections = extract_commander_sections_from_json(payload)
 
-    return normalize_commander_tags(html_tags + json_tags)
+    tags = normalize_commander_tags(html_tags + json_tags)
+    return CommanderMetadata(tags=tags, sections=sections)
 
 
 def _find_next_data(html: str, url: str) -> Dict[str, Any]:
@@ -472,7 +516,7 @@ def fetch_average_deck(
     """Fetch and parse EDHREC average deck data."""
 
     normalized_name = (name or "").strip() or None
-    normalized_bracket = (bracket or "").strip().lower() if bracket else None
+    normalized_bracket = None
     available_brackets: Optional[Set[str]] = None
 
     own_session = False
@@ -480,7 +524,14 @@ def fetch_average_deck(
         session = requests.Session()
         own_session = True
 
-    commander_tags: List[str] = []
+    commander_metadata = CommanderMetadata(
+        tags=[],
+        sections={
+            "High Synergy Cards": [],
+            "Top Cards": [],
+            "Game Changers": [],
+        },
+    )
 
     try:
         if source_url:
@@ -488,10 +539,16 @@ def fetch_average_deck(
         else:
             if not normalized_name:
                 raise ValueError("Commander name is required")
-            if not normalized_bracket:
+            if not bracket or not bracket.strip():
                 raise ValueError("Bracket must be provided when source_url is omitted")
 
-            discovery = find_average_deck_url(session, normalized_name, normalized_bracket)
+            normalized_bracket = normalize_average_deck_bracket(bracket)
+
+            discovery = find_average_deck_url(
+                session,
+                normalized_name,
+                display_average_deck_bracket(normalized_bracket),
+            )
             raw_url = discovery.get("source_url")
             normalized_url, slug, normalized_bracket = _normalize_average_deck_url(str(raw_url))
             available_data = discovery.get("available_brackets")
@@ -499,14 +556,21 @@ def fetch_average_deck(
                 available_brackets = {str(item) for item in available_data}
         payload = _fetch_average_deck_payload(
             slug,
-            normalized_bracket or "upgraded",
+            normalized_bracket or "",
             session=session,
             source_url=normalized_url,
         )
         try:
-            commander_tags = _fetch_commander_tags(slug, session)
+            commander_metadata = _fetch_commander_metadata(slug, session)
         except Exception:  # pragma: no cover - defensive network handling
-            commander_tags = []
+            commander_metadata = CommanderMetadata(
+                tags=[],
+                sections={
+                    "High Synergy Cards": [],
+                    "Top Cards": [],
+                    "Game Changers": [],
+                },
+            )
     finally:
         if own_session:
             session.close()
@@ -543,17 +607,20 @@ def fetch_average_deck(
 
     result: Dict[str, Any] = {
         "commander": normalized_name or (commander_card["name"] if commander_card else None),
-        "bracket": payload.get("bracket", normalized_bracket or "upgraded"),
+        "bracket": display_average_deck_bracket(payload.get("bracket", normalized_bracket or "")),
         "source_url": payload.get("source_url"),
         "cards": final_cards,
         "commander_card": commander_card,
-        "commander_tags": commander_tags,
+        "commander_tags": commander_metadata.tags,
+        "commander_high_synergy_cards": commander_metadata.sections.get("High Synergy Cards", []),
+        "commander_top_cards": commander_metadata.sections.get("Top Cards", []),
+        "commander_game_changers": commander_metadata.sections.get("Game Changers", []),
     }
 
     if result["commander"] is None:
         result.pop("commander")
 
     if available_brackets is not None:
-        result["available_brackets"] = sorted(available_brackets)
+        result["available_brackets"] = sorted(str(item) for item in available_brackets)
 
     return result
