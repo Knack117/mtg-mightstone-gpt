@@ -31,6 +31,25 @@ _SECTION_KEY_MAP: Dict[str, str] = {
     "gamechanger": "Game Changers",
 }
 _MAX_TAG_LENGTH = 64
+_STRUCTURAL_TAG_NAMES = {
+    "themes",
+    "kindred",
+    "new cards",
+    "high synergy",
+    "high synergy cards",
+    "top cards",
+    "game changers",
+    "card types",
+    "creatures",
+    "instants",
+    "sorceries",
+    "utility artifacts",
+    "enchantments",
+    "planeswalkers",
+    "utility lands",
+    "mana artifacts",
+    "lands",
+}
 
 
 def extract_build_id_from_html(html: str) -> Optional[str]:
@@ -192,9 +211,16 @@ def _collect_tag_entries(source: Any, *, treat_as_tag: bool) -> List[str]:
 
         for key, value in source.items():
             key_lower = key.lower() if isinstance(key, str) else ""
-            if key_lower in {"tags", "themes", "items", "list", "entries"}:
+            if key_lower in {"tags", "themes", "items", "list", "entries", "values", "chips"}:
                 tags.extend(_collect_tag_entries(value, treat_as_tag=True))
-            elif key_lower in {"sections", "groups", "tabgroups", "tabs"}:
+            elif key_lower in {
+                "sections",
+                "groups",
+                "tabgroups",
+                "tabs",
+                "taggroups",
+                "collections",
+            }:
                 tags.extend(_collect_tag_entries(value, treat_as_tag=False))
 
         return tags
@@ -248,6 +274,8 @@ def normalize_commander_tags(values: Iterable[str]) -> List[str]:
         if len(cleaned) > _MAX_TAG_LENGTH:
             continue
         if not re.search(r"[A-Za-z]", cleaned):
+            continue
+        if cleaned.lower() in _STRUCTURAL_TAG_NAMES:
             continue
         key = cleaned.lower()
         if key in seen:
