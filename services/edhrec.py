@@ -24,7 +24,12 @@ from utils.edhrec_commander import (
     extract_commander_sections_from_json,
     extract_commander_tags_from_html,
     extract_commander_tags_from_json,
+    extract_commander_tags_with_counts_from_html,
+    extract_commander_tags_with_counts_from_json,
+    normalize_commander_tag_name,
     normalize_commander_tags,
+    parse_commander_count,
+    split_commander_tag_name_and_count,
 )
 
 __all__ = [
@@ -679,31 +684,6 @@ def _coerce_budget_segment(budget: Optional[str]) -> Optional[str]:
     if resolved not in {"budget", "expensive"}:
         raise ValueError("Budget must be 'budget' or 'expensive'")
     return resolved
-
-
-def _parse_count(value: Optional[str]) -> Optional[int]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        try:
-            return int(value)
-        except (ValueError, TypeError):
-            return None
-    text = str(value).strip().lower()
-    if not text:
-        return None
-    text = text.replace(",", "")
-    multiplier = 1
-    if text.endswith("k"):
-        multiplier, text = 1000, text[:-1]
-    elif text.endswith("m"):
-        multiplier, text = 1_000_000, text[:-1]
-    try:
-        return int(float(text) * multiplier)
-    except ValueError:
-        return None
-
-
 def _parse_percentage(value: Any) -> Optional[float]:
     if value is None or isinstance(value, bool):
         return None
@@ -729,199 +709,6 @@ def _parse_percentage(value: Any) -> Optional[float]:
             amount *= 100.0
         return round(amount, 2)
     return None
-
-
-def _split_tag_name_and_count(text: str) -> Tuple[str, Optional[int]]:
-    cleaned = text.strip()
-    if not cleaned:
-        return "", None
-    match = re.search(r"\(([^)]+)\)\s*$", cleaned)
-    if match:
-        count = _parse_count(match.group(1))
-        name = cleaned[: match.start()].strip()
-        return name, count
-    match = re.search(r"([0-9][0-9,\.]*\s*[kKmM]?)(?:\s+decks?|$)", cleaned)
-    if match and match.end() == len(cleaned):
-        count = _parse_count(match.group(1))
-        name = cleaned[: match.start()].strip(" -:\u2013")
-        return name, count
-    return cleaned, None
-
-
-def _clean_commander_tag_name(name: str) -> Optional[str]:
-    """Return a normalized commander tag name or ``None`` if invalid."""
-
-    cleaned = normalize_commander_tags([name])
-    if not cleaned:
-        return None
-    return cleaned[0]
-
-
-def _extract_tags_with_counts_from_html(html: str) -> List[Dict[str, Any]]:
-    soup = BeautifulSoup(html, "html.parser")
-    merged: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
-
-    def record(name: str, count: Optional[int]) -> None:
-        normalized = _clean_commander_tag_name(name)
-        if not normalized:
-            return
-        key = normalized.lower()
-        if key in merged:
-            if merged[key]["deck_count"] is None and isinstance(count, int):
-                merged[key]["deck_count"] = count
-            return
-        merged[key] = {"name": normalized, "deck_count": count if isinstance(count, int) else None}
-
-    def _class_list(value: Any) -> List[str]:
-        if not value:
-            return []
-        if isinstance(value, str):
-            return [part for part in value.split() if part]
-        if isinstance(value, (list, tuple, set)):
-            return [str(part) for part in value if isinstance(part, str) and part]
-        return []
-
-    nav_panel = soup.find(
-        "div",
-        class_=lambda value: any(cls.startswith("NavigationPanel_tags__") for cls in _class_list(value)),
-    )
-    if nav_panel:
-        anchors = nav_panel.find_all("a", href=True)
-        for anchor in anchors:
-            href = anchor.get("href", "")
-            if not _TAG_LINK_RE.search(href or ""):
-                continue
-            label_node = anchor.find(
-                "span",
-                class_=lambda value: any(
-                    cls.startswith("NavigationPanel_label__") for cls in _class_list(value)
-                ),
-            )
-            raw_name = label_node.get_text(" ", strip=True) if label_node else anchor.get_text(" ", strip=True)
-            name, inline_count = _split_tag_name_and_count(raw_name)
-            count_node = anchor.find(
-                "span",
-                class_=lambda value: (
-                    any(cls.startswith("badge") for cls in _class_list(value))
-                    or any(cls.startswith("NavigationPanel_count__") for cls in _class_list(value))
-                ),
-            )
-            count = _parse_count(count_node.get_text(" ", strip=True)) if count_node else None
-            if count is None:
-                count = inline_count
-            record(name, count)
-
-    for anchor in soup.find_all("a", href=True):
-        href = anchor.get("href", "")
-        if not _TAG_LINK_RE.search(href or ""):
-            continue
-        count: Optional[int] = None
-        for attr in ("data-tag-count", "data-count", "data-deck-count"):
-            if attr in anchor.attrs:
-                count = _parse_count(anchor.attrs.get(attr))
-                if count is not None:
-                    break
-        if count is None:
-            for child in anchor.find_all(["span", "div"]):
-                child_text = child.get_text(" ", strip=True)
-                _, child_count = _split_tag_name_and_count(child_text)
-                if child_count is not None:
-                    count = child_count
-                    break
-        text = anchor.get_text(" ", strip=True)
-        name, parsed_count = _split_tag_name_and_count(text)
-        if count is None:
-            count = parsed_count
-        record(name, count)
-
-    return list(merged.values())
-
-
-def _extract_tags_with_counts_from_payload(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    commander = (
-        payload.get("props", {})
-        .get("pageProps", {})
-        .get("commander")
-    )
-    if not isinstance(commander, dict):
-        return []
-
-    merged: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
-
-    def record(name: str, count: Optional[int]) -> None:
-        normalized = _clean_commander_tag_name(name or "")
-        if not normalized:
-            return
-        key = normalized.lower()
-        if key in merged:
-            if merged[key]["deck_count"] is None and isinstance(count, int):
-                merged[key]["deck_count"] = count
-            return
-        merged[key] = {"name": normalized, "deck_count": count if isinstance(count, int) else None}
-
-    visited: Set[int] = set()
-
-    def walk(node: Any, *, is_tag_context: bool = False) -> None:
-        node_id = id(node)
-        if node_id in visited:
-            return
-        visited.add(node_id)
-
-        if isinstance(node, dict):
-            slug_value = None
-            for key in ("slug", "href", "url", "path"):
-                raw = node.get(key)
-                if isinstance(raw, str) and _TAG_LINK_RE.search(raw):
-                    slug_value = raw
-                    break
-            tag_field = node.get("tag") or node.get("theme")
-            name_field: Optional[str] = None
-            for key in ("name", "label", "title", "displayName"):
-                raw = node.get(key)
-                if isinstance(raw, str) and raw.strip():
-                    name_field = raw.strip()
-                    break
-            if name_field is None and isinstance(tag_field, dict):
-                for key in ("name", "label", "title"):
-                    raw = tag_field.get(key)
-                    if isinstance(raw, str) and raw.strip():
-                        name_field = raw.strip()
-                        break
-            elif name_field is None and isinstance(tag_field, str):
-                name_field = tag_field.strip()
-
-            count_value: Optional[int] = None
-            for key in ("deckCount", "deck_count", "numDecks", "num_decks", "count", "decks"):
-                count_value = _parse_count(node.get(key))
-                if count_value is not None:
-                    break
-
-            is_tag = is_tag_context or slug_value is not None or tag_field is not None
-
-            if name_field and count_value is not None and is_tag:
-                record(name_field, count_value)
-
-            for child_key, child_value in node.items():
-                if isinstance(child_value, (dict, list, tuple, set)):
-                    child_tag_context = is_tag or child_key.lower() in {
-                        "tags",
-                        "themes",
-                        "tagcloud",
-                        "tag_cloud",
-                        "taggroups",
-                        "groups",
-                    }
-                    walk(child_value, is_tag_context=child_tag_context)
-
-        elif isinstance(node, (list, tuple, set)):
-            for entry in node:
-                if isinstance(entry, (dict, list, tuple, set)):
-                    walk(entry, is_tag_context=is_tag_context)
-
-    walk(commander)
-    return list(merged.values())
-
-
 def _merge_tag_sources(*sources: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     merged: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
     for source in sources:
@@ -930,10 +717,10 @@ def _merge_tag_sources(*sources: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
         for entry in source:
             if not isinstance(entry, dict):
                 continue
-            name = entry.get("name")
+            name = entry.get("tag") or entry.get("name")
             if not isinstance(name, str):
                 continue
-            normalized_name = _clean_commander_tag_name(name)
+            normalized_name = normalize_commander_tag_name(name)
             if not normalized_name:
                 continue
             key = normalized_name.lower()
@@ -943,14 +730,14 @@ def _merge_tag_sources(*sources: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
                 if merged[key]["deck_count"] is None and count_value is not None:
                     merged[key]["deck_count"] = count_value
             else:
-                merged[key] = {"name": normalized_name, "deck_count": count_value}
+                merged[key] = {"tag": normalized_name, "deck_count": count_value}
     filtered: List[Dict[str, Any]] = []
     for entry in merged.values():
-        cleaned = normalize_commander_tags([entry.get("name", "")])
+        cleaned = normalize_commander_tags([entry.get("tag", "")])
         if not cleaned:
             continue
-        name = cleaned[0]
-        filtered.append({"name": name, "deck_count": entry.get("deck_count")})
+        tag_name = cleaned[0]
+        filtered.append({"tag": tag_name, "deck_count": entry.get("deck_count")})
     return filtered
 
 
@@ -958,8 +745,8 @@ def _sort_tags_by_deck_count(tags: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     def sort_key(entry: Dict[str, Any]) -> Tuple[float, str]:
         count = entry.get("deck_count")
         if isinstance(count, int):
-            return (-float(count), entry["name"].lower())
-        return (float("inf"), entry["name"].lower())
+            return (-float(count), entry["tag"].lower())
+        return (float("inf"), entry["tag"].lower())
 
     return sorted(tags, key=sort_key)
 
@@ -1018,7 +805,7 @@ def _parse_cardlists_from_json(payload: Optional[Dict[str, Any]]) -> Dict[str, L
                     "count",
                     "decks",
                 ):
-                    num_decks = _parse_count(entry.get(key))
+                    num_decks = parse_commander_count(entry.get(key))
                     if num_decks is not None:
                         break
 
@@ -1030,7 +817,7 @@ def _parse_cardlists_from_json(payload: Optional[Dict[str, Any]]) -> Dict[str, L
                     "potential",
                     "deckSampleSize",
                 ):
-                    potential_decks = _parse_count(entry.get(key))
+                    potential_decks = parse_commander_count(entry.get(key))
                     if potential_decks is not None:
                         break
 
@@ -1126,8 +913,10 @@ def fetch_commander_summary(
         payload = _extract_next_payload(html, url)
         categories = _normalize_summary_categories(_parse_cardlists_from_json(payload))
 
-        tags_from_payload = _extract_tags_with_counts_from_payload(payload or {}) if payload else []
-        tags_from_html = _extract_tags_with_counts_from_html(html)
+        tags_from_payload = (
+            extract_commander_tags_with_counts_from_json(payload) if payload else []
+        )
+        tags_from_html = extract_commander_tags_with_counts_from_html(html)
 
         json_tag_names = extract_commander_tags_from_json(payload) if payload else []
         html_tag_names = extract_commander_tags_from_html(html)
@@ -1135,15 +924,15 @@ def fetch_commander_summary(
         combined_tags = _merge_tag_sources(
             tags_from_payload,
             tags_from_html,
-            ({"name": tag, "deck_count": None} for tag in json_tag_names),
-            ({"name": tag, "deck_count": None} for tag in html_tag_names),
+            ({"tag": tag, "deck_count": None} for tag in json_tag_names),
+            ({"tag": tag, "deck_count": None} for tag in html_tag_names),
         )
 
         if not combined_tags:
             fallback_names = normalize_commander_tags(json_tag_names + html_tag_names)
             if fallback_names:
                 combined_tags = [
-                    {"name": name, "deck_count": None} for name in fallback_names
+                    {"tag": tag_name, "deck_count": None} for tag_name in fallback_names
                 ]
 
         top_tags = _sort_tags_by_deck_count(combined_tags)[:10]
@@ -1326,10 +1115,10 @@ def fetch_tag_index(
             tag_slug = match.group(1)
             anchor_identity = match.group(2) or identity_slug
             text = anchor.get_text(" ", strip=True)
-            name, count = _split_tag_name_and_count(text)
+            name, count = split_commander_tag_name_and_count(text)
             for attr in ("data-tag-count", "data-count", "data-deck-count"):
                 if attr in anchor.attrs:
-                    attr_count = _parse_count(anchor.attrs.get(attr))
+                    attr_count = parse_commander_count(anchor.attrs.get(attr))
                     if attr_count is not None:
                         count = attr_count
                         break

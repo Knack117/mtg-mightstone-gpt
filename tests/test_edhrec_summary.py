@@ -149,16 +149,17 @@ def test_fetch_commander_summary_parses_sections_and_tags():
     assert categories["Creatures"][0]["deck_count"] == 150
     assert categories["Creatures"][0]["potential_deck_count"] == 300
     assert isinstance(summary["tags"], list)
-    tags_by_name = {tag["name"]: tag for tag in summary["tags"]}
+    tags_by_name = {tag["tag"]: tag for tag in summary["tags"]}
     assert tags_by_name["Proliferate"]["deck_count"] == 1234
     assert tags_by_name["Angels"]["deck_count"] == 987
 
-    assert {tag["name"] for tag in summary["tags"]} >= {"Proliferate", "Angels"}
+    assert {tag["tag"] for tag in summary["tags"]} >= {"Proliferate", "Angels"}
     assert "Kindred" not in tags_by_name
     assert "Themes" not in tags_by_name
+    assert "High Synergy Cards" not in tags_by_name
 
     top_tag = summary["top_tags"][0]
-    assert top_tag["name"] == "Proliferate"
+    assert top_tag["tag"] == "Proliferate"
     assert top_tag["deck_count"] == 1234
 
 
@@ -198,7 +199,7 @@ def test_fetch_commander_summary_reads_navigation_panel_tags():
 
     summary = edhrec.fetch_commander_summary(name, session=session)
 
-    tags_by_name = {tag["name"]: tag for tag in summary["tags"]}
+    tags_by_name = {tag["tag"]: tag for tag in summary["tags"]}
     assert tags_by_name["Ninjas"]["deck_count"] == 1500
     assert tags_by_name["Mutant"]["deck_count"] == 250
 
@@ -252,12 +253,12 @@ def test_fetch_commander_summary_handles_nested_tag_entries():
 
     summary = edhrec.fetch_commander_summary(name, session=session)
 
-    tag_names = [entry["name"] for entry in summary["tags"]]
+    tag_names = [entry["tag"] for entry in summary["tags"]]
     assert tag_names == ["+1/+1 Counters", "Mutate", "Energy", "Counters"]
-    counts = {entry["name"]: entry["deck_count"] for entry in summary["tags"]}
+    counts = {entry["tag"]: entry["deck_count"] for entry in summary["tags"]}
     assert counts["+1/+1 Counters"] == 980
     assert counts["Mutate"] == 430
-    assert summary["top_tags"][0]["name"] == "+1/+1 Counters"
+    assert summary["top_tags"][0]["tag"] == "+1/+1 Counters"
 
 
 def test_fetch_commander_summary_handles_missing_tag_counts():
@@ -321,7 +322,7 @@ def test_fetch_commander_summary_handles_missing_tag_counts():
 
     summary = edhrec.fetch_commander_summary(name, session=session)
 
-    tag_names = [entry["name"] for entry in summary["tags"]]
+    tag_names = [entry["tag"] for entry in summary["tags"]]
 
     assert "Kindred" not in tag_names
     assert "Themes" not in tag_names
