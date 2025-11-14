@@ -821,6 +821,26 @@ def edhrec_average_deck(
     return response
 
 
+@app.get("/edhrec/budget-comparison")
+def edhrec_budget_comparison(
+    name: str = Query(..., description="Commander name (printed name)"),
+):
+    """
+    Fetch both budget and expensive average deck variants for a commander.
+    
+    This endpoint returns both the All (Budget) and All (Expensive) average decks
+    from EDHREC, allowing comparison between budget-friendly and high-power-cost builds.
+    """
+    from handlers.edhrec_budget import edhrec_budget_comparison as handler
+    
+    payload, status_code = handler(name)
+    if status_code != 200:
+        if "detail" in payload:
+            raise HTTPException(status_code=status_code, detail=payload["detail"])
+        return payload
+    return payload
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health():
     return HealthResponse(status="ok")
