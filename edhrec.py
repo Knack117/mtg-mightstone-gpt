@@ -165,7 +165,7 @@ def _pick_avg_link(html: str, bracket: str) -> Optional[Dict[str, Set[str] | Opt
                 "available": buckets,
             }
 
-    if bracket and fallback_all and "all" in buckets:
+    if not bracket and fallback_all and "all" in buckets:
         return {
             "url": f"https://edhrec.com{fallback_all}",
             "available": buckets,
@@ -188,24 +188,19 @@ def find_average_deck_url(
     normalized_bracket = normalize_average_deck_bracket(bracket)
 
     commander_url = _find_commander_page(session, name)
+    commander_page_success = False
+    
     if commander_url:
         html = _fetch_html(session, commander_url)
         picked = _pick_avg_link(html, normalized_bracket)
         if picked and picked["url"]:
+            # Found exact match on commander page
             return {
                 "source_url": picked["url"],
                 "available_brackets": picked["available"],
             }
-        if picked and not picked["url"]:
-            raise ValueError(
-                {
-                    "code": "BRACKET_UNAVAILABLE",
-                    "message": f"Bracket '{bracket}' not found for '{name}'",
-                    "available_brackets": sorted(picked["available"]),
-                    "commander_url": commander_url,
-                }
-            )
 
+    # Try candidate URLs as fallback (regardless of commander page result)
     for slug in commander_slug_candidates(name or ""):
         if not slug:
             continue
