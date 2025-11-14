@@ -1,297 +1,1171 @@
-"""Helpers for discovering EDHREC commander and average-deck URLs."""
-
 from __future__ import annotations
-
+import json
 import re
 import time
-from typing import Dict, Optional, Set, Tuple
-from urllib.parse import quote_plus
-
+from collections import OrderedDict
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urlparse
 import requests
-
-from utils.commander_identity import commander_slug_candidates
-
-UA = "MightstoneBot/1.0 (+https://github.com/Knack117/mtg-mightstone-gpt)"
-
-
-_PRIMARY_AVERAGE_DECK_BRACKETS: Tuple[str, ...] = (
-    "",
-    "exhibition",
-    "core",
-    "upgraded",
-    "optimized",
-    "cedh",
+from bs4 import BeautifulSoup
+from edhrec import (
+    find_average_deck_url,
+    display_average_deck_bracket,
+    normalize_average_deck_bracket,
+)
+from utils.commander_identity import commander_to_slug
+from utils.edhrec_commander import (
+    extract_build_id_from_html,
+    extract_commander_sections_from_json,
+    extract_commander_tags_from_html,
+    extract_commander_tags_from_json,
+    extract_commander_tags_with_counts_from_html,
+    extract_commander_tags_with_counts_from_json,
+    normalize_commander_tag_name,
+    normalize_commander_tags,
+    parse_commander_count,
+    split_commander_tag_name_and_count,
 )
 
-_BUDGET_SEGMENTS: Tuple[str, ...] = ("budget", "expensive")
+__all__ = [
+    "EdhrecError",
+    "EdhrecNotFoundError",
+    "EdhrecParsingError",
+    "EdhrecTimeoutError",
+    "average_deck_url",
+    "deep_find_cards",
+    "fetch_average_deck",
+    "slugify_commander",
+    "fetch_commander_summary",
+    "fetch_commander_tag_theme",
+    "fetch_tag_theme",
+    "fetch_tag_index",
+]
 
+USER_AGENT = "Mightstone-GPT/1.0 (+https://mtg-mightstone-gpt.onrender.com)"
+REQUEST_TIMEOUT = 12
+RETRY_ATTEMPTS = 2
+CACHE_TTL_SECONDS = 15 * 60
 
-def _build_allowed_average_deck_paths() -> Tuple[str, ...]:
-    paths: list[str] = []
-    for bracket in _PRIMARY_AVERAGE_DECK_BRACKETS:
-        if bracket not in paths:
-            paths.append(bracket)
-        for segment in _BUDGET_SEGMENTS:
-            if bracket:
-                combo = f"{bracket}/{segment}"
-            else:
-                combo = segment
-            if combo not in paths:
-                paths.append(combo)
-    return tuple(paths)
-
-
-_ALLOWED_AVERAGE_DECK_PATHS: Tuple[str, ...] = _build_allowed_average_deck_paths()
-
-_AVERAGE_DECK_BRACKET_ALIASES = {
-    "": "",
-    "all": "",
-    "average": "",
-    "default": "",
-    "exhibition": "exhibition",
-    "exhibitition": "exhibition",
-    "precon": "exhibition",
-    "core": "core",
-    "upgraded": "upgraded",
-    "optimized": "optimized",
-    "cedh": "cedh",
-    "1": "exhibition",
-    "2": "core",
-    "3": "upgraded",
-    "4": "optimized",
-    "5": "cedh",
-    "budget": "budget",
-    "expensive": "expensive",
-    "exhibition/budget": "exhibition/budget",
-    "exhibition-budget": "exhibition/budget",
-    "exhibitition/budget": "exhibition/budget",
-    "exhibitition-budget": "exhibition/budget",
-    "exhibition/expensive": "exhibition/expensive",
-    "exhibition-expensive": "exhibition/expensive",
-    "exhibitition/expensive": "exhibition/expensive",
-    "exhibitition-expensive": "exhibition/expensive",
-    "core/budget": "core/budget",
-    "core-budget": "core/budget",
-    "core/expensive": "core/expensive",
-    "core-expensive": "core/expensive",
-    "upgraded/budget": "upgraded/budget",
-    "upgraded-budget": "upgraded/budget",
-    "upgraded/expensive": "upgraded/expensive",
-    "upgraded-expensive": "upgraded/expensive",
-    "optimized/budget": "optimized/budget",
-    "optimized-budget": "optimized/budget",
-    "optimized/expensive": "optimized/expensive",
-    "optimized-expensive": "optimized/expensive",
-    "cedh/budget": "cedh/budget",
-    "cedh-budget": "cedh/budget",
-    "cedh/expensive": "cedh/expensive",
-    "cedh-expensive": "cedh/expensive",
+_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
 }
-def _get(session: requests.Session, url: str, retries: int = 2) -> requests.Response:
-    """Perform a GET with lightweight retry handling."""
+_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
 
-    last: Optional[requests.Response] = None
-    for attempt in range(retries + 1):
-        response = session.get(url, headers={"User-Agent": UA}, timeout=15)
-        if response.status_code in (429, 503) and attempt < retries:
-            time.sleep(0.8 * (attempt + 1))
-            last = response
-            continue
-        response.raise_for_status()
-        return response
-    assert last is not None
-    last.raise_for_status()
-    return last  # pragma: no cover - raise_for_status will always raise
+@dataclass
+class CommanderMetadata:
+    tags: List[str]
+    sections: Dict[str, List[str]]
+
+class EdhrecError(RuntimeError):
+    def __init__(self, message: str, url: str, details: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.url = url
+        self.details = details
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {"message": str(self), "url": self.url}
+        if self.details:
+            payload["details"] = self.details
+        return payload
 
 
-def _fetch_html(session: requests.Session, url: str) -> str:
-    return _get(session, url).text
+class EdhrecTimeoutError(EdhrecError):
+    pass
 
 
-def _find_commander_page(session: requests.Session, name: str) -> Optional[str]:
-    """Return the EDHREC commander page for *name* if one exists."""
+class EdhrecNotFoundError(EdhrecError):
+    pass
 
-    for slug in commander_slug_candidates(name or ""):
-        if not slug:
-            continue
-        url = f"https://edhrec.com/commanders/{slug}"
-        response = session.get(url, headers={"User-Agent": UA}, timeout=15)
-        if response.status_code == 200:
-            return url
 
-    query = quote_plus(name or "")
-    search_url = f"https://edhrec.com/search?q={query}"
-    html = _fetch_html(session, search_url)
-    match = re.search(r'href="(/commanders/[a-z0-9\-]+)"', html)
-    return f"https://edhrec.com{match.group(1)}" if match else None
+class EdhrecParsingError(EdhrecError):
+    pass
+
+
+def slugify_commander(name: str) -> str:
+    return commander_to_slug(name or "")
+
+
+def average_deck_url(name: str, bracket: str = "upgraded") -> str:
+    slug = slugify_commander(name)
+    normalized_bracket = normalize_average_deck_bracket(bracket)
+    if normalized_bracket:
+        return f"https://scryfall.com/average-decks/{slug}/{normalized_bracket}"
+    return f"https://scryfall.com/average-decks/{slug}"
+
+
+def _cache_key(slug: str, bracket: str) -> Tuple[str, str]:
+    return slug, (bracket or "")
+
+
+def _request_average_deck(url: str, session: Optional[requests.Session] = None) -> str:
+    last_exc: Optional[EdhrecError] = None
+    for attempt in range(RETRY_ATTEMPTS + 1):
+        try:
+            if session is not None:
+                response = session.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+            else:
+                response = requests.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+        except requests.Timeout:
+            last_exc = EdhrecTimeoutError(
+                f"Timeout fetching EDHREC page after {REQUEST_TIMEOUT}s", url
+            )
+        except requests.RequestException as exc:
+            last_exc = EdhrecError(f"Network error talking to EDHREC: {exc}", url)
+        else:
+            if response.status_code == 404:
+                raise EdhrecNotFoundError("Average deck not found for this commander/bracket", url)
+            if response.status_code >= 500 and attempt < RETRY_ATTEMPTS:
+                time.sleep(0.3 * (attempt + 1))
+                continue
+            try:
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                last_exc = EdhrecError(f"Unexpected response: {exc}", url)
+            else:
+                return response.text
+        time.sleep(0.2 * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
 _AVERAGE_DECK_PATH_RE = re.compile(
-    r"^/average-decks/([a-z0-9\-]+)(?:/([a-z0-9\-]+)(?:/([a-z0-9\-]+))?)?$"
+    r"^/average-decks/([a-z0-9-]+)(?:/([a-z0-9-]+)(?:/([a-z0-9-]+))?)?$"
 )
 
+def _normalize_average_deck_url(url: str) -> Tuple[str, str, str]:
+    if not url or not str(url).strip():
+        raise ValueError("source_url is required")
 
-def _pick_avg_link(html: str, bracket: str) -> Optional[Dict[str, Set[str] | Optional[str]]]:
-    links = re.findall(r'href="(/average-decks/[a-z0-9\-]+(?:/[a-z0-9\-]+){0,2})"', html)
-    links = list(dict.fromkeys(links))
-    if not links:
-        return None
+    parsed = urlparse(str(url).strip())
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise ValueError("source_url must be http or https")
 
-    normalized_links: list[Tuple[str, str]] = []
-    buckets: Set[str] = set()
-    fallback_all: Optional[str] = None
+    netloc = parsed.netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    if netloc != "scryfall.com":
+        raise ValueError("source_url must point to scryfall.com")
 
-    for path in links:
-        match = _AVERAGE_DECK_PATH_RE.match(path)
-        if not match:
-            continue
-        bracket_parts = [part for part in match.groups()[1:] if part]
-        raw_bracket = "/".join(bracket_parts)
-        normalized = _coerce_average_deck_bracket(raw_bracket)
-        if normalized is None:
-            continue
-        normalized_links.append((path, normalized))
-        buckets.add(display_average_deck_bracket(normalized))
-        if normalized == "":
-            fallback_all = path
+    path = parsed.path.rstrip("/")
+    match = _AVERAGE_DECK_PATH_RE.match(path)
+    if not match:
+        raise ValueError("source_url must be an EDHREC average-decks URL")
 
-    if not normalized_links:
-        return None
+    slug = match.group(1)
+    bracket_parts = [part for part in match.groups()[1:] if part]
+    raw_bracket = "/".join(bracket_parts)
+    normalized_bracket = normalize_average_deck_bracket(raw_bracket)
 
-    for path, normalized in normalized_links:
-        if normalized == bracket:
-            return {
-                "url": f"https://edhrec.com{path}",
-                "available": buckets,
-            }
+    normalized_url = f"https://scryfall.com/average-decks/{slug}"
+    if normalized_bracket:
+        normalized_url += f"/{normalized_bracket}"
 
-    if not bracket and fallback_all and "all" in buckets:
-        return {
-            "url": f"https://edhrec.com{fallback_all}",
-            "available": buckets,
-        }
-
-    return {"url": None, "available": buckets}
+    return normalized_url, slug, normalized_bracket
 
 
-def find_average_deck_url(
-    session: requests.Session, name: str, bracket: str
-) -> Dict[str, Set[str] | str]:
-    """Discover the EDHREC average-decks URL for *(name, bracket)*."""
-
-    if not name or not (name.strip()):
-        raise ValueError({"code": "NAME_REQUIRED", "message": "Commander name is required"})
-
-    if bracket is None or not bracket.strip():
-        raise ValueError({"code": "BRACKET_REQUIRED", "message": "Bracket is required"})
-
+def _fetch_average_deck_payload(
+    slug: str,
+    bracket: str,
+    *,
+    session: Optional[requests.Session] = None,
+    source_url: Optional[str] = None,
+) -> Dict[str, Any]:
     normalized_bracket = normalize_average_deck_bracket(bracket)
+    key = _cache_key(slug, normalized_bracket)
+    now = time.time()
+    cached = _CACHE.get(key)
+    if cached and now - cached[0] < CACHE_TTL_SECONDS:
+        return json.loads(json.dumps(cached[1]))
 
-    commander_url = _find_commander_page(session, name)
-    commander_page_success = False
-    
-    if commander_url:
-        html = _fetch_html(session, commander_url)
-        picked = _pick_avg_link(html, normalized_bracket)
-        if picked and picked["url"]:
-            # Found exact match on commander page
-            return {
-                "source_url": picked["url"],
-                "available_brackets": picked["available"],
-            }
-
-    # Try candidate URLs as fallback (regardless of commander page result)
-    for slug in commander_slug_candidates(name or ""):
-        if not slug:
-            continue
+    if source_url:
+        url = source_url
+    else:
+        url = f"https://scryfall.com/commanders/{slug}"
         if normalized_bracket:
-            url = f"https://edhrec.com/average-decks/{slug}/{normalized_bracket}"
-        else:
-            url = f"https://edhrec.com/average-decks/{slug}"
-        response = session.get(url, headers={"User-Agent": UA}, timeout=15)
-        if response.status_code == 200:
-            return {
-                "source_url": url,
-                "available_brackets": {display_average_deck_bracket(normalized_bracket)},
-            }
+            url += f"/{normalized_bracket}"
 
-    query = quote_plus(name or "")
-    search_url = f"https://edhrec.com/search?q={query}"
-    html = _fetch_html(session, search_url)
-    match = re.search(r'href="(/average-decks/[a-z0-9\-]+(?:/[a-z0-9\-]+){1,2})"', html)
-    if match:
-        path = match.group(1)
-        match_path = _AVERAGE_DECK_PATH_RE.match(path)
-        if match_path:
-            bracket_parts = [part for part in match_path.groups()[1:] if part]
-            normalized = _coerce_average_deck_bracket("/".join(bracket_parts))
-        else:
-            normalized = None
-        url = f"https://edhrec.com{path}"
-        return {
-            "source_url": url,
-            "available_brackets": {
-                display_average_deck_bracket(normalized) if normalized is not None else bracket
-            },
-        }
-
-    raise ValueError(
+    html = _request_average_deck(url, session=session)
+    payload = _find_next_data(html, url)
+    cards = _find_cards_in_payload(payload, url)
+    normalized_cards = [
         {
-            "code": "NOT_FOUND",
-            "message": f"Could not resolve average-decks URL for '{name}'",
-            "hints": [
-                "Check spelling/front-face name",
-                "Pair may be too new or not indexed",
-            ],
+            "name": card.name,
+            "qty": int(card.qty),
+            "is_commander": bool(card.is_commander),
         }
-    )
+        for card in cards
+        if card.qty > 0 and card.name
+    ]
+    result = {
+        "source_url": url,
+        "bracket": normalized_bracket,
+        "cards": normalized_cards,
+    }
+    _CACHE[key] = (now, json.loads(json.dumps(result)))
+    return json.loads(json.dumps(result))
 
 
-def display_average_deck_bracket(path: str) -> str:
-    return "all" if not path else path
+def _fetch_commander_metadata(slug: str, session: requests.Session) -> CommanderMetadata:
+    if not slug:
+        return CommanderMetadata(tags=[], sections={
+            "High Synergy Cards": [],
+            "Top Cards": [],
+            "Game Changers": [],
+        })
 
-
-def allowed_average_deck_brackets() -> Tuple[str, ...]:
-    """Return the supported average-deck bracket identifiers."""
-
-    return tuple(display_average_deck_bracket(path) for path in _ALLOWED_AVERAGE_DECK_PATHS)
-
-
-def normalize_average_deck_bracket(bracket: Optional[str]) -> str:
-    """Return the normalized EDHREC average-deck bracket path."""
-
-    text = (bracket or "").strip().lower()
-    text = text.replace("\\", "/")
-    text = re.sub(r"/+", "/", text)
-    text = text.strip("/")
-
-    if not text:
-        return ""
-
-    normalized = _AVERAGE_DECK_BRACKET_ALIASES.get(text, text)
-    if normalized in _ALLOWED_AVERAGE_DECK_PATHS:
-        return normalized
-
-    raise ValueError(
-        {
-            "code": "BRACKET_UNSUPPORTED",
-            "message": f"Bracket '{bracket}' is not supported",
-            "allowed_brackets": allowed_average_deck_brackets(),
-        }
-    )
-
-
-def _coerce_average_deck_bracket(bracket: Optional[str]) -> Optional[str]:
+    commander_url = f"https://scryfall.com/commanders/{slug}"
     try:
-        return normalize_average_deck_bracket(bracket)
-    except ValueError:
+        response = session.get(commander_url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException:
+        return CommanderMetadata(tags=[], sections={
+            "High Synergy Cards": [],
+            "Top Cards": [],
+            "Game Changers": [],
+        })
+
+    if response.status_code != 200:
+        return CommanderMetadata(tags=[], sections={
+            "High Synergy Cards": [],
+            "Top Cards": [],
+            "Game Changers": [],
+        })
+
+    html = response.text
+    html_tags = extract_commander_tags_from_html(html)
+    build_id = extract_build_id_from_html(html)
+
+    json_tags: List[str] = []
+    sections: Dict[str, List[str]] = {
+        "High Synergy Cards": [],
+        "Top Cards": [],
+        "Game Changers": [],
+    }
+
+    if build_id:
+        json_url = f"https://scryfall.com/_next/data/{build_id}/commanders/{slug}.json"
+        try:
+            json_response = session.get(json_url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException:
+            json_response = None
+        else:
+            if json_response.status_code == 200:
+                try:
+                    payload = json_response.json()
+                except ValueError:
+                    payload = None
+                else:
+                    json_tags = extract_commander_tags_from_json(payload)
+                    sections = extract_commander_sections_from_json(payload)
+
+    if json_tags:
+        tags = normalize_commander_tags(json_tags)
+    else:
+        tags = normalize_commander_tags(html_tags)
+
+    return CommanderMetadata(tags=tags, sections=sections)
+
+
+def _find_next_data(html: str, url: str) -> Dict[str, Any]:
+    soup = BeautifulSoup(html, "html.parser")
+    script = soup.find("script", id="__NEXT_DATA__")
+    if not script or not script.string:
+        raise EdhrecParsingError("Missing __NEXT_DATA__ payload", url, "script id=__NEXT_DATA__")
+    try:
+        return json.loads(script.string)
+    except json.JSONDecodeError as exc:
+        raise EdhrecParsingError("Invalid JSON in __NEXT_DATA__", url, str(exc)) from exc
+
+
+def _looks_card_container_key(key: str) -> bool:
+    normalized = key.lower()
+    return any(token in normalized for token in ("deck", "cards", "average", "mainboard", "board"))
+
+
+def deep_find_cards(obj: Any) -> Optional[List[Any]]:
+    seen_lists: List[List[Any]] = []
+    seen_ids: set[int] = set()
+
+    def is_card_like(item: Any) -> bool:
+        if isinstance(item, str):
+            stripped = item.strip()
+            if not stripped:
+                return False
+            if re.match(r'^\d+\s+[A-Za-z]', stripped):
+                return False
+            return True
+        if isinstance(item, dict):
+            if isinstance(item.get("card"), dict) and isinstance(item["card"].get("name"), str):
+                return True
+            for name_key in ("name", "cardName", "label", "cardname"):
+                if isinstance(item.get(name_key), str):
+                    name_value = str(item.get(name_key, "")).strip()
+                    if re.match(r'^\d+\s+[A-Za-z]', name_value):
+                        return False
+                    return True
+            if isinstance(item.get("names"), list) and all(isinstance(v, str) for v in item["names"]):
+                return True
+        return False
+
+    def walk(node: Any) -> None:
+        if isinstance(node, list):
+            node_id = id(node)
+            if node_id in seen_ids:
+                return
+            if node and all(is_card_like(entry) for entry in node):
+                seen_ids.add(node_id)
+                seen_lists.append(node)
+                return
+            seen_ids.add(node_id)
+            for entry in node:
+                walk(entry)
+        elif isinstance(node, dict):
+            for value in node.values():
+                walk(value)
+
+    walk(obj)
+
+    if not seen_lists:
+        return None
+
+    flattened: List[Any] = []
+    for entries in seen_lists:
+        flattened.extend(entries)
+    return flattened
+
+
+@dataclass
+class _NormalizedCard:
+    name: str
+    qty: int
+    is_commander: bool = False
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        value = value.strip()
+        if value.isdigit():
+            return int(value)
+    return None
+
+
+def _normalize_card_entry(entry: Any) -> Optional[_NormalizedCard]:
+    if isinstance(entry, str):
+        name = entry.strip()
+        if not name:
+            return None
+        if re.match(r'^\d+\s+[A-Za-z]', name):
+            return None
+        return _NormalizedCard(name=name, qty=1)
+
+    if not isinstance(entry, dict):
+        return None
+
+    source = entry
+    if isinstance(entry.get("card"), dict):
+        source = {**entry, **entry["card"]}
+
+    name: Optional[str] = None
+    for key in ("name", "cardName", "card_name", "label", "title"):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            if re.match(r'^\d+\s+[A-Za-z]', value.strip()):
+                return None
+            name = value.strip()
+            break
+
+    if not name and isinstance(source.get("names"), list):
+        names = [v.strip() for v in source["names"] if isinstance(v, str) and v.strip()]
+        if names:
+            name = " // ".join(names)
+
+    if not name:
+        return None
+
+    qty: Optional[int] = None
+    for key in ("qty", "quantity", "count", "copies", "amount", "q"):
+        qty = _coerce_int(source.get(key))
+        if qty is not None:
+            break
+    if qty is None:
+        qty = 1
+
+    is_commander = False
+    for flag in ("isCommander", "is_commander", "commander"):
+        value = source.get(flag)
+        if isinstance(value, bool):
+            is_commander = is_commander or value
+
+    categories = source.get("categories")
+    if isinstance(categories, Sequence) and not isinstance(categories, (str, bytes)):
+        if any(str(cat).strip().lower() == "commander" for cat in categories if cat is not None):
+            is_commander = True
+
+    role = source.get("role") or source.get("slot")
+    if isinstance(role, str) and role.strip().lower() == "commander":
+        is_commander = True
+
+    return _NormalizedCard(name=name, qty=max(1, qty), is_commander=is_commander)
+
+
+def _normalize_cards(entries: Iterable[Any]) -> List[_NormalizedCard]:
+    normalized: List[_NormalizedCard] = []
+    for entry in entries:
+        card = _normalize_card_entry(entry)
+        if card is not None:
+            normalized.append(card)
+    return normalized
+
+
+def _dedupe_cards(cards: Iterable[_NormalizedCard]) -> List[_NormalizedCard]:
+    combined: "OrderedDict[str, _NormalizedCard]" = OrderedDict()
+    for card in cards:
+        key = card.name
+        if key in combined:
+            existing = combined[key]
+            combined[key] = _NormalizedCard(
+                name=existing.name,
+                qty=existing.qty + card.qty,
+                is_commander=existing.is_commander or card.is_commander,
+            )
+        else:
+            combined[key] = card
+    return list(combined.values())
+
+
+def _extract_commander_card(
+    name: Optional[str], cards: List[_NormalizedCard]
+) -> Tuple[Optional[Dict[str, Any]], List[_NormalizedCard]]:
+    normalized_name = (name or "").strip()
+    commander_names = [part.strip() for part in re.split(r"//", normalized_name)] if normalized_name else []
+    commander_names = [n for n in commander_names if n]
+    normalized_lookup = {n.lower(): n for n in commander_names}
+    full_name_lower = normalized_name.lower() if normalized_name else None
+
+    commander_entries: List[_NormalizedCard] = []
+    remaining: List[_NormalizedCard] = []
+
+    for card in cards:
+        card_name_lower = card.name.lower()
+        is_match = card.is_commander
+
+        if full_name_lower and card_name_lower == full_name_lower:
+            is_match = True
+
+        if normalized_lookup and card_name_lower in normalized_lookup:
+            is_match = True
+
+        if is_match:
+            commander_entries.append(card)
+        else:
+            remaining.append(card)
+
+    if not commander_entries:
+        return None, cards
+
+    total_qty = sum(card.qty for card in commander_entries)
+    component_names = [card.name for card in commander_entries]
+
+    if normalized_name:
+        commander_name = normalized_name
+    else:
+        commander_name = " // ".join(component_names)
+
+    commander_card: Dict[str, Any] = {"name": commander_name, "qty": total_qty}
+    if len(component_names) > 1 or commander_name.lower() != commander_entries[0].name.lower():
+        commander_card["components"] = component_names
+
+    return commander_card, remaining
+
+
+def _find_cards_in_payload(data: Dict[str, Any], url: str) -> List[_NormalizedCard]:
+    props = data.get("props") or {}
+    page_props = props.get("pageProps") or {}
+
+    candidate_sources: List[Any] = []
+    for key, value in page_props.items():
+        if _looks_card_container_key(str(key)):
+            candidate_sources.append(value)
+    if "pageData" in page_props:
+        candidate_sources.append(page_props["pageData"])
+
+    for source in candidate_sources:
+        cards = deep_find_cards(source)
+        if cards:
+            normalized = _normalize_cards(cards)
+            if normalized:
+                return _dedupe_cards(normalized)
+
+    cards = deep_find_cards(page_props) or deep_find_cards(data)
+    if cards:
+        normalized = _normalize_cards(cards)
+        if normalized:
+            return _dedupe_cards(normalized)
+
+    keys = ", ".join(sorted(page_props.keys())) or "(no keys)"
+    raise EdhrecParsingError("Could not parse EDHREC average deck", url, f"pageProps keys: {keys}")
+
+
+def fetch_average_deck(
+    name: Optional[str] = None,
+    bracket: Optional[str] = "upgraded",
+    *,
+    source_url: Optional[str] = None,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    normalized_name = (name or "").strip() or None
+    normalized_bracket = None
+    available_brackets: Optional[Set[str]] = None
+
+    own_session = False
+    if session is None:
+        session = requests.Session()
+        own_session = True
+
+    commander_metadata = CommanderMetadata(
+        tags=[],
+        sections={
+            "High Synergy Cards": [],
+            "Top Cards": [],
+            "Game Changers": [],
+        },
+    )
+
+    try:
+        if source_url:
+            normalized_url, slug, normalized_bracket = _normalize_average_deck_url(source_url)
+        else:
+            if not normalized_name:
+                raise ValueError("Commander name is required")
+            if not bracket or not bracket.strip():
+                raise ValueError("Bracket must be provided when source_url is omitted")
+
+            normalized_bracket = normalize_average_deck_bracket(bracket)
+
+            discovery = find_average_deck_url(
+                session,
+                normalized_name,
+                display_average_deck_bracket(normalized_bracket),
+            )
+            raw_url = discovery.get("source_url")
+            normalized_url, slug, normalized_bracket = _normalize_average_deck_url(str(raw_url))
+
+            available_data = discovery.get("available_brackets")
+            if isinstance(available_data, (set, list, tuple)):
+                available_brackets = {str(item) for item in available_data}
+
+        payload = _fetch_average_deck_payload(
+            slug,
+            normalized_bracket or "",
+            session=session,
+            source_url=normalized_url,
+        )
+
+        try:
+            commander_metadata = _fetch_commander_metadata(slug, session)
+        except Exception:
+            commander_metadata = CommanderMetadata(
+                tags=[],
+                sections={
+                    "High Synergy Cards": [],
+                    "Top Cards": [],
+                    "Game Changers": [],
+                },
+            )
+    finally:
+        if own_session:
+            session.close()
+
+    cards_payload = payload.get("cards", [])
+    cards: List[_NormalizedCard] = []
+    for entry in cards_payload:
+        if not isinstance(entry, dict):
+            continue
+        name_value = entry.get("name")
+        qty_value = entry.get("qty")
+
+        if not isinstance(name_value, str):
+            continue
+
+        qty_int = _coerce_int(qty_value)
+        if qty_int is None:
+            continue
+
+        cards.append(
+            _NormalizedCard(
+                name=name_value,
+                qty=max(1, qty_int),
+                is_commander=bool(entry.get("is_commander")),
+            )
+        )
+
+    commander_card, remaining_cards = _extract_commander_card(normalized_name, cards)
+
+    final_cards = [
+        {"name": card.name, "qty": card.qty}
+        for card in remaining_cards
+        if card.qty > 0 and card.name
+    ]
+
+    if not final_cards:
+        raise EdhrecParsingError("Parsed deck contained no cards", payload.get("source_url", ""), None)
+
+    resolved_bracket = payload.get("bracket", normalized_bracket or "")
+    
+    if bracket and bracket.strip().lower() == "core" and resolved_bracket == "all":
+        available_bracket_list = list(available_brackets) if available_brackets else []
+        available_brackets_info = f" (available brackets: {', '.join(available_bracket_list)})" if available_bracket_list else ""
+        print(f"Warning: Requested 'core' bracket fell back to 'all'{available_brackets_info}")
+
+    result: Dict[str, Any] = {
+        "commander": normalized_name or (commander_card["name"] if commander_card else None),
+        "bracket": display_average_deck_bracket(resolved_bracket),
+        "source_url": payload.get("source_url"),
+        "cards": final_cards,
+        "commander_card": commander_card,
+        "commander_tags": commander_metadata.tags,
+        "commander_high_synergy_cards": commander_metadata.sections.get("High Synergy Cards", []),
+        "commander_top_cards": commander_metadata.sections.get("Top Cards", []),
+        "commander_game_changers": commander_metadata.sections.get("Game Changers", []),
+    }
+
+    if result["commander"] is None:
+        result.pop("commander")
+
+    if available_brackets is not None:
+        result["available_brackets"] = sorted(str(item) for item in available_brackets)
+
+    return result
+
+_SUMMARY_SECTION_ORDER: Tuple[str, ...] = (
+    "New Cards",
+    "High Synergy Cards",
+    "Top Cards",
+    "Game Changers",
+    "Creatures",
+    "Instants",
+    "Sorceries",
+    "Utility Artifacts",
+    "Enchantments",
+    "Battles",
+    "Planeswalkers",
+    "Utility Lands",
+    "Mana Artifacts",
+    "Lands",
+)
+
+_TAG_LINK_RE = re.compile(r"/(?:tags|themes)/[a-z0-9-]+(?:/[a-z0-9-]+)?", re.IGNORECASE)
+
+def _coerce_budget_segment(budget: Optional[str]) -> Optional[str]:
+    if budget is None:
+        return None
+    normalized = budget.strip().lower()
+    if not normalized:
+        return None
+    aliases = {
+        "budget": "budget",
+        "cheap": "budget",
+        "low": "budget",
+        "expensive": "expensive",
+        "premium": "expensive",
+        "high": "expensive",
+    }
+    resolved = aliases.get(normalized, normalized)
+    if resolved not in {"budget", "expensive"}:
+        raise ValueError("Budget must be 'budget' or 'expensive'")
+    return resolved
+
+
+def _parse_percentage(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        amount = float(value)
+        if -1.0 <= amount <= 1.0:
+            amount *= 100.0
+        return round(amount, 2)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        match = re.search(r"[-+]?[0-9]+(?:[.,][0-9]+)?", text)
+        if not match:
+            return None
+        try:
+            amount = float(match.group(0).replace(",", ""))
+        except ValueError:
+            return None
+        if "%" in text or "percent" in text.lower():
+            return round(amount, 2)
+        if -1.0 <= amount <= 1.0:
+            amount *= 100.0
+        return round(amount, 2)
+    return None
+
+
+def _merge_tag_sources(*sources: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+    for source in sources:
+        if not source:
+            continue
+        for entry in source:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("tag") or entry.get("name")
+            if not isinstance(name, str):
+                continue
+            normalized_name = normalize_commander_tag_name(name)
+            if not normalized_name:
+                continue
+            key = normalized_name.lower()
+            count = entry.get("deck_count")
+            count_value = int(count) if isinstance(count, (int, float)) else None
+
+            if key in merged:
+                if merged[key]["deck_count"] is None and count_value is not None:
+                    merged[key]["deck_count"] = count_value
+            else:
+                merged[key] = {"tag": normalized_name, "deck_count": count_value}
+
+    filtered: List[Dict[str, Any]] = []
+    for entry in merged.values():
+        cleaned = normalize_commander_tags([entry.get("tag", "")])
+        if not cleaned:
+            continue
+        tag_name = cleaned[0]
+        filtered.append({"tag": tag_name, "deck_count": entry.get("deck_count")})
+
+    return filtered
+
+
+def _sort_tags_by_deck_count(tags: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def sort_key(entry: Dict[str, Any]) -> Tuple[float, str]:
+        count = entry.get("deck_count")
+        if isinstance(count, int):
+            return (-float(count), entry["tag"].lower())
+        return (float("inf"), entry["tag"].lower())
+
+    return sorted(tags, key=sort_key)
+
+
+def _parse_cardlists_from_json(payload: Optional[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    categories: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
+    if not isinstance(payload, dict):
+        return {}
+
+    page_props = payload.get("props", {}).get("pageProps", {})
+    container = page_props.get("data", {}).get("container", {})
+    json_dict = container.get("json_dict") or container.get("jsonDict") or {}
+
+    cardlists = json_dict.get("cardlists")
+    if not isinstance(cardlists, list):
+        return {}
+
+    for section in cardlists:
+        if not isinstance(section, dict):
+            continue
+        header = section.get("header") or section.get("name") or section.get("title")
+        if not isinstance(header, str) or not header.strip():
+            continue
+        header_text = header.strip()
+
+        cards_out: List[Dict[str, Any]] = []
+        for key in ("cardviews", "cards", "items"):
+            card_entries = section.get(key)
+            if not isinstance(card_entries, list):
+                continue
+
+            for entry in card_entries:
+                if not isinstance(entry, dict):
+                    continue
+
+                name = None
+                for name_key in ("name", "cardName", "label", "title"):
+                    raw = entry.get(name_key)
+                    if isinstance(raw, str) and raw.strip():
+                        name = raw.strip()
+                        break
+                if name is None and isinstance(entry.get("names"), list):
+                    parts = [str(part).strip() for part in entry["names"] if isinstance(part, str) and part.strip()]
+                    if parts:
+                        name = " // ".join(parts)
+                if not name:
+                    continue
+
+                synergy_pct = _parse_percentage(
+                    entry.get("synergy")
+                    or entry.get("synergy_percent")
+                    or entry.get("synergyPercent")
+                    or entry.get("synergy_pct")
+                )
+
+                num_decks: Optional[int] = None
+                for key in (
+                    "num_decks",
+                    "numDecks",
+                    "deckCount",
+                    "deck_count",
+                    "count",
+                    "decks",
+                ):
+                    num_decks = parse_commander_count(entry.get(key))
+                    if num_decks is not None:
+                        break
+
+                potential_decks: Optional[int] = None
+                for key in (
+                    "potential_decks",
+                    "potentialDecks",
+                    "totalDecks",
+                    "potential",
+                    "deckSampleSize",
+                ):
+                    potential_decks = parse_commander_count(entry.get(key))
+                    if potential_decks is not None:
+                        break
+
+                inclusion_pct: Optional[float] = None
+                if (
+                    isinstance(num_decks, int)
+                    and isinstance(potential_decks, int)
+                    and potential_decks
+                ):
+                    try:
+                        inclusion_pct = round(
+                            float(num_decks) / float(potential_decks) * 100, 2
+                        )
+                    except ZeroDivisionError:
+                        inclusion_pct = None
+
+                if inclusion_pct is None:
+                    inclusion_pct = _parse_percentage(
+                        entry.get("inclusion")
+                        or entry.get("inclusion_percent")
+                        or entry.get("inclusionPercent")
+                        or entry.get("inclusion_pct")
+                    )
+
+                cards_out.append(
+                    {
+                        "name": name,
+                        "inclusion_percent": inclusion_pct,
+                        "deck_count": num_decks,
+                        "potential_deck_count": potential_decks,
+                        "synergy_percent": synergy_pct,
+                    }
+                )
+
+        if cards_out:
+            categories[header_text] = cards_out
+
+    return dict(categories)
+
+
+def _normalize_summary_categories(categories: Dict[str, List[Dict[str, Any]]]) -> Dict[str, List[Dict[str, Any]]]:
+    ordered: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
+    for header in _SUMMARY_SECTION_ORDER:
+        ordered[header] = list(categories.get(header, []))
+    for header, cards in categories.items():
+        if header not in ordered:
+            ordered[header] = cards
+    return dict(ordered)
+
+
+def _extract_next_payload(html: str, url: str) -> Optional[Dict[str, Any]]:
+    try:
+        return _find_next_data(html, url)
+    except EdhrecParsingError:
+        return None
+    except Exception:
         return None
 
 
-__all__ = [
-    "find_average_deck_url",
-    "allowed_average_deck_brackets",
-    "display_average_deck_bracket",
-    "normalize_average_deck_bracket",
-]
+def _extract_page_metadata(html: str) -> Tuple[Optional[str], Optional[str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    title_tag = soup.find("title")
+    meta_desc = soup.find("meta", attrs={"name": "description"})
 
+    title = title_tag.get_text(strip=True) if title_tag else None
+    description = meta_desc.get("content", None) if meta_desc else None
+    if isinstance(description, str):
+        description = description.strip()
+
+    return title, description
+
+
+def fetch_commander_summary(
+    name: str,
+    *,
+    budget: Optional[str] = None,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    if not name or not name.strip():
+        raise ValueError("Commander name is required")
+
+    slug = commander_to_slug(name.strip())
+    budget_segment = _coerce_budget_segment(budget)
+
+    own_session = False
+    if session is None:
+        session = requests.Session()
+        own_session = True
+
+    try:
+        url = f"https://scryfall.com/commanders/{slug}"
+        if budget_segment:
+            url = f"{url}/{budget_segment}"
+
+        response = session.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        html = response.text
+
+        payload = _extract_next_payload(html, url)
+        categories = _normalize_summary_categories(_parse_cardlists_from_json(payload))
+
+        tags_from_payload = (
+            extract_commander_tags_with_counts_from_json(payload) if payload else []
+        )
+        tags_from_html = extract_commander_tags_with_counts_from_html(html)
+        json_tag_names = extract_commander_tags_from_json(payload) if payload else []
+        html_tag_names = extract_commander_tags_from_html(html)
+
+        combined_tags = _merge_tag_sources(
+            tags_from_payload,
+            tags_from_html,
+            ({"tag": tag, "deck_count": None} for tag in json_tag_names),
+            ({"tag": tag, "deck_count": None} for tag in html_tag_names),
+        )
+
+        if not combined_tags:
+            fallback_names = normalize_commander_tags(json_tag_names + html_tag_names)
+            if fallback_names:
+                combined_tags = [
+                    {"tag": tag_name, "deck_count": None} for tag_name in fallback_names
+                ]
+
+        top_tags = _sort_tags_by_deck_count(combined_tags)[:10]
+
+        return {
+            "commander": name.strip(),
+            "slug": slug,
+            "source_url": url,
+            "budget": budget_segment,
+            "categories": categories,
+            "tags": combined_tags,
+            "top_tags": top_tags,
+        }
+    finally:
+        if own_session:
+            session.close()
+
+
+def _slugify_tag(value: str) -> str:
+    text = (value or "").strip().lower()
+    text = text.replace("+", " plus ")
+    text = re.sub(r"[`'`]+", "", text)
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    if not text:
+        raise ValueError("Tag name is required")
+    return text
+
+
+def _normalize_identity_slug(identity: Optional[str]) -> Optional[str]:
+    if identity is None:
+        return None
+    text = identity.strip().lower()
+    if not text:
+        return None
+    text = text.replace("+", "-")
+    text = re.sub(r"[^a-z0-9-]+", "-", text)
+    text = re.sub(r"-{2,}", "-", text).strip("-")
+    return text or None
+
+
+def fetch_commander_tag_theme(
+    name: str,
+    tag: str,
+    *,
+    budget: Optional[str] = None,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    if not name or not name.strip():
+        raise ValueError("Commander name is required")
+    if not tag or not tag.strip():
+        raise ValueError("Tag name is required")
+
+    slug = commander_to_slug(name.strip())
+    tag_slug = _slugify_tag(tag)
+    budget_segment = _coerce_budget_segment(budget)
+
+    own_session = False
+    if session is None:
+        session = requests.Session()
+        own_session = True
+
+    try:
+        url = f"https://scryfall.com/commanders/{slug}"
+        if budget_segment:
+            url = f"{url}/{budget_segment}"
+        url = f"{url}/{tag_slug}"
+
+        response = session.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+        if response.status_code == 404:
+            raise EdhrecNotFoundError("Commander tag theme not found", url)
+        response.raise_for_status()
+        html = response.text
+
+        payload = _extract_next_payload(html, url)
+        categories = _normalize_summary_categories(_parse_cardlists_from_json(payload))
+        title, description = _extract_page_metadata(html)
+
+        if not title:
+            display_tag = tag_slug.replace("-", " ").title()
+            title = f"{name.strip()} – {display_tag} | EDHREC"
+
+        return {
+            "commander": name.strip(),
+            "slug": slug,
+            "tag": tag_slug,
+            "budget": budget_segment,
+            "source_url": url,
+            "header": title,
+            "description": description or "",
+            "categories": categories,
+        }
+    finally:
+        if own_session:
+            session.close()
+
+
+def fetch_tag_theme(
+    tag: str,
+    *,
+    identity: Optional[str] = None,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    if not tag or not tag.strip():
+        raise ValueError("Tag name is required")
+
+    tag_slug = _slugify_tag(tag)
+    identity_slug = _normalize_identity_slug(identity)
+
+    own_session = False
+    if session is None:
+        session = requests.Session()
+        own_session = True
+
+    try:
+        url = f"https://scryfall.com/tags/{tag_slug}"
+        if identity_slug:
+            url = f"{url}/{identity_slug}"
+
+        response = session.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+        if response.status_code == 404:
+            raise EdhrecNotFoundError("Tag theme not found", url)
+        response.raise_for_status()
+        html = response.text
+
+        payload = _extract_next_payload(html, url)
+        categories = _normalize_summary_categories(_parse_cardlists_from_json(payload))
+        title, description = _extract_page_metadata(html)
+
+        if not title:
+            display_tag = tag_slug.replace("-", " ").title()
+            if identity_slug:
+                display_identity = identity_slug.replace("-", " ").title()
+                title = f"{display_tag} – {display_identity} | EDHREC"
+            else:
+                title = f"{display_tag} | EDHREC"
+
+        return {
+            "tag": tag_slug,
+            "identity": identity_slug,
+            "source_url": url,
+            "header": title,
+            "description": description or "",
+            "categories": categories,
+        }
+    finally:
+        if own_session:
+            session.close()
+
+
+def fetch_tag_index(
+    *,
+    identity: Optional[str] = None,
+    session: Optional[requests.Session] = None,
+) -> Dict[str, Any]:
+    identity_slug = _normalize_identity_slug(identity)
+
+    own_session = False
+    if session is None:
+        session = requests.Session()
+        own_session = True
+
+    try:
+        url = "https://scryfall.com/tags"
+        if identity_slug:
+            url = f"{url}/{identity_slug}"
+
+        response = session.get(url, headers=_HEADERS, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        html = response.text
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        tags: "OrderedDict[Tuple[str, Optional[str]], Dict[str, Any]]" = OrderedDict()
+        for anchor in soup.find_all("a", href=True):
+            href = anchor.get("href", "") or ""
+            match = re.match(r"^/tags/([a-z0-9-]+)(?:/([a-z0-9-]+))?", href)
+            if not match:
+                continue
+
+            tag_slug = match.group(1)
+            anchor_identity = match.group(2) or identity_slug
+            text = anchor.get_text(" ", strip=True)
+            name, count = split_commander_tag_name_and_count(text)
+
+            for attr in ("data-tag-count", "data-count", "data-deck-count"):
+                if attr in anchor.attrs:
+                    attr_count = parse_commander_count(anchor.attrs.get(attr))
+                    if attr_count is not None:
+                        count = attr_count
+                    break
+
+            key = (tag_slug.lower(), anchor_identity.lower() if anchor_identity else None)
+            tag_url = f"https://scryfall.com/tags/{tag_slug}"
+            if anchor_identity:
+                tag_url = f"{tag_url}/{anchor_identity}"
+
+            entry = tags.get(key)
+            if entry is None:
+                tags[key] = {
+                    "name": name or tag_slug.replace("-", " ").title(),
+                    "slug": tag_slug,
+                    "identity": anchor_identity,
+                    "url": tag_url,
+                    "deck_count": count if isinstance(count, int) else None,
+                }
+            else:
+                if name and (not entry.get("name") or entry["name"].lower() == entry["slug"].replace("-", " ").lower()):
+                    entry["name"] = name
+                if entry.get("deck_count") is None and isinstance(count, int):
+                    entry["deck_count"] = count
+
+        return {
+            "identity": identity_slug,
+            "source_url": url,
+            "tags": list(tags.values()),
+        }
+    finally:
+        if own_session:
+            session.close()
