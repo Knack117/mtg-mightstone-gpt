@@ -29,6 +29,7 @@ def test_theme_nextdebug_returns_raw_payload(monkeypatch, client):
             "json_url": "https://edhrec.com/_next/data/mock/tags/prowess/jeskai.json",
             "header": "Jeskai Prowess | EDHREC",
             "description": "Sample description",
+            "html": "<html></html>",
             "data": {"pageProps": {"collections": []}},
         }
 
@@ -83,4 +84,54 @@ def test_theme_nextdebug_propagates_http_errors(monkeypatch, client, status_code
     resp = client.get("/edhrec/theme_nextdebug", params={"name": "prowess", "identity": "wur"})
     assert resp.status_code == status_code
     assert resp.json()["detail"] == "boom"
+
+
+def test_theme_route_extracts_tags(monkeypatch, client):
+    async def fake_fetch_theme_resources(name: str, identity: str):
+        return {
+            "tag_slug": "heroes-in-a-half-shell",
+            "color_slug": "five-color",
+            "label": "Five-Color",
+            "tag_html_url": "https://edhrec.com/tags/heroes-in-a-half-shell/five-color",
+            "json_url": "https://edhrec.com/_next/data/mock/tags/heroes-in-a-half-shell/five-color.json",
+            "header": "Five-Color Heroes in a Half Shell | EDHREC",
+            "description": "Sample description",
+            "html": "<html><body></body></html>",
+            "data": {
+                "pageProps": {
+                    "tag": {
+                        "topics": [
+                            {
+                                "taggings": [
+                                    {"tag": {"name": "Mutant Tribal"}},
+                                    {"tag": {"label": "Ninjutsu"}},
+                                ]
+                            }
+                        ],
+                        "chips": [{"label": "+1/+1 Counters"}],
+                    },
+                    "extra": {
+                        "taggings": [
+                            {"theme": {"title": "Shellshock"}},
+                            {"tag": "Equipment Matters"},
+                            {"chip": {"displayName": "Teamwork"}},
+                        ]
+                    },
+                }
+            },
+        }
+
+    monkeypatch.setattr("app._fetch_theme_resources", fake_fetch_theme_resources)
+
+    resp = client.get("/edhrec/theme", params={"name": "heroes-in-a-half-shell", "identity": "wubrg"})
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["tags"] == [
+        "Mutant Tribal",
+        "Ninjutsu",
+        "+1/+1 Counters",
+        "Shellshock",
+        "Equipment Matters",
+        "Teamwork",
+    ]
 

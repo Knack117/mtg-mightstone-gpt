@@ -575,6 +575,92 @@ async def commander_summary_handler(name: str) -> Dict[str, Any]:
     )
     return page.dict()
 
+def _extract_theme_tags_from_payload(payload: Any) -> List[str]:
+    """Return a normalized list of theme tags from a Next.js payload."""
+
+    if not isinstance(payload, dict):
+        return []
+
+    page_props: Optional[Dict[str, Any]] = None
+    if "pageProps" in payload and isinstance(payload["pageProps"], dict):
+        page_props = payload["pageProps"]
+    else:
+        props = payload.get("props")
+        if isinstance(props, dict) and isinstance(props.get("pageProps"), dict):
+            page_props = props["pageProps"]
+
+    if not page_props:
+        return []
+
+    collected: List[str] = []
+    seen: Set[str] = set()
+    visited: Set[int] = set()
+
+    TAG_CONTAINER_KEYS = {
+        "tags",
+        "taggings",
+        "tagitems",
+        "tagchips",
+        "chips",
+        "topics",
+        "themes",
+        "archetypes",
+        "relatedtags",
+        "similar_tags",
+        "similartags",
+        "taggroups",
+        "theme_tags",
+        "themetags",
+    }
+    TAG_ENTRY_KEYS = {"tag", "theme", "chip", "topic", "archetype", "tagging"}
+    NAME_FIELDS = ("name", "label", "title", "displayName", "display_name", "tagName", "text", "value")
+
+    def record(value: str) -> None:
+        for normalized in normalize_commander_tags([value]):
+            lowered = normalized.lower()
+            if lowered and lowered not in seen:
+                collected.append(normalized)
+                seen.add(lowered)
+
+    def walk(node: Any, treat_as_tag: bool = False) -> None:
+        if isinstance(node, (dict, list)):
+            node_id = id(node)
+            if node_id in visited:
+                return
+            visited.add(node_id)
+
+        if isinstance(node, dict):
+            if treat_as_tag:
+                for field in NAME_FIELDS:
+                    value = node.get(field)
+                    if isinstance(value, str):
+                        record(value)
+                for nested_key in TAG_ENTRY_KEYS:
+                    if nested_key in node:
+                        walk(node[nested_key], True)
+
+            for key, value in node.items():
+                if not isinstance(key, str):
+                    walk(value, False)
+                    continue
+                lower = key.lower()
+                if lower in TAG_CONTAINER_KEYS:
+                    walk(value, True)
+                elif lower in TAG_ENTRY_KEYS:
+                    walk(value, True)
+                else:
+                    walk(value, False)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, treat_as_tag)
+        elif isinstance(node, str):
+            if treat_as_tag:
+                record(node)
+
+    walk(page_props, False)
+    return collected
+
+
 async def _fetch_theme_resources(name: str, identity: str) -> Dict[str, Any]:
     tag_slug = (name or "").strip().lower()
     try:
@@ -602,6 +688,7 @@ async def _fetch_theme_resources(name: str, identity: str) -> Dict[str, Any]:
         "json_url": json_url,
         "header": header,
         "description": description,
+        "html": html,
         "data": data,
     }
 
@@ -628,6 +715,10 @@ async def fetch_theme_tag(name: str, identity: str) -> PageTheme:
         items = [ThemeItem(name=n) for n in buckets[k]]
         collections.append(ThemeCollection(header=k, items=items))
 
+    tags = _extract_theme_tags_from_payload(resources["data"])
+    if not tags:
+        tags = extract_commander_tags_from_html(resources.get("html", ""))
+
     header = resources["header"]
     if not header:
         header = f"{resources['label']} {resources['tag_slug'].title()} | EDHREC"
@@ -635,6 +726,7 @@ async def fetch_theme_tag(name: str, identity: str) -> PageTheme:
     return PageTheme(
         header=header,
         description=resources["description"],
+        tags=tags,
         container=ThemeContainer(collections=collections),
         source_url=resources["tag_html_url"],
     )
