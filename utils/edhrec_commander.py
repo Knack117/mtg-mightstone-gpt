@@ -458,39 +458,23 @@ def _extract_tags_from_new_structure(links: List[Any]) -> List[str]:
     return tags
 
 
-def _extract_tags_with_counts_from_new_structure(links: List[Any], record_func) -> None:  # type: ignore[no-untyped-def]
-    """Extract tags with counts from the new EDHREC structure (2025+)."""
-    found_tags_section = False
+def _extract_tags_with_counts_from_new_structure(taglinks: List[Any], record_func) -> None:  # type: ignore[no-untyped-def]
+    """Extract tags with counts from the new EDHREC structure (2025+).
     
-    for link_section in links:
-        if not isinstance(link_section, dict):
+    Note: Deck counts are in panels.taglinks[], NOT in panels.links[]
+    Each taglinks item has: {count: int, slug: str, value: str}
+    """
+    for item in taglinks:
+        if not isinstance(item, dict):
             continue
-            
-        header = link_section.get("header", "")
         
-        if header == "Tags":
-            found_tags_section = True
+        tag_name = item.get("value")
+        count_value = item.get("count")
         
-        if found_tags_section:
-            if header and header != "Tags":
-                break
-            
-            items = link_section.get("items", [])
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                    
-                tag_name = item.get("value")
-                tag_href = item.get("href")
-                
-                if tag_name and tag_href and "/tags/" in tag_href:
-                    # Try to extract count if available
-                    count = None
-                    for key in ("count", "deckCount", "deck_count", "numDecks"):
-                        count = parse_commander_count(item.get(key))
-                        if count is not None:
-                            break
-                    record_func(tag_name, count)
+        if tag_name:
+            # Parse count value
+            count = parse_commander_count(count_value) if count_value is not None else None
+            record_func(tag_name, count)
 
 
 def _extract_commander_payload(payload: Any) -> Optional[Dict[str, Any]]:
@@ -573,9 +557,10 @@ def extract_commander_tags_with_counts_from_json(payload: Any) -> List[Dict[str,
                 if isinstance(page_data, dict):
                     panels = page_data.get("panels")
                     if isinstance(panels, dict):
-                        links = panels.get("links")
-                        if isinstance(links, list):
-                            _extract_tags_with_counts_from_new_structure(links, record)
+                        # Use taglinks for deck counts (contains both tag names and counts)
+                        taglinks = panels.get("taglinks")
+                        if isinstance(taglinks, list):
+                            _extract_tags_with_counts_from_new_structure(taglinks, record)
                             if merged:
                                 return list(merged.values())
 
