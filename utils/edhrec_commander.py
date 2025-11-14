@@ -417,6 +417,82 @@ def _collect_tag_entries(source: Any, *, treat_as_tag: bool) -> List[str]:
     return tags
 
 
+def _extract_tags_from_new_structure(links: List[Any]) -> List[str]:
+    """Extract tags from the new EDHREC structure (2025+).
+    
+    Tags are in: props.pageProps.data.panels.links[]
+    The first section has header="Tags", subsequent sections have empty headers.
+    """
+    tags: List[str] = []
+    found_tags_section = False
+    
+    for link_section in links:
+        if not isinstance(link_section, dict):
+            continue
+            
+        header = link_section.get("header", "")
+        
+        # Start collecting when we hit the "Tags" header
+        if header == "Tags":
+            found_tags_section = True
+        
+        # Continue collecting from sections with empty headers after "Tags"
+        # Stop when we hit a new named section
+        if found_tags_section:
+            if header and header != "Tags":
+                # Hit a new section, stop
+                break
+            
+            items = link_section.get("items", [])
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                    
+                tag_name = item.get("value")
+                tag_href = item.get("href")
+                
+                # Only include items that are tag links
+                if tag_name and tag_href and "/tags/" in tag_href:
+                    tags.append(tag_name)
+    
+    return tags
+
+
+def _extract_tags_with_counts_from_new_structure(links: List[Any], record_func) -> None:  # type: ignore[no-untyped-def]
+    """Extract tags with counts from the new EDHREC structure (2025+)."""
+    found_tags_section = False
+    
+    for link_section in links:
+        if not isinstance(link_section, dict):
+            continue
+            
+        header = link_section.get("header", "")
+        
+        if header == "Tags":
+            found_tags_section = True
+        
+        if found_tags_section:
+            if header and header != "Tags":
+                break
+            
+            items = link_section.get("items", [])
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                    
+                tag_name = item.get("value")
+                tag_href = item.get("href")
+                
+                if tag_name and tag_href and "/tags/" in tag_href:
+                    # Try to extract count if available
+                    count = None
+                    for key in ("count", "deckCount", "deck_count", "numDecks"):
+                        count = parse_commander_count(item.get(key))
+                        if count is not None:
+                            break
+                    record_func(tag_name, count)
+
+
 def _extract_commander_payload(payload: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(payload, dict):
         return None
@@ -434,6 +510,24 @@ def _extract_commander_payload(payload: Any) -> Optional[Dict[str, Any]]:
 def extract_commander_tags_from_json(payload: Any) -> List[str]:
     """Return commander theme tags discovered in EDHREC Next.js payloads."""
 
+    # Try NEW structure first (current EDHREC format as of 2025)
+    # Path: props → pageProps → data → panels → links
+    if isinstance(payload, dict):
+        props = payload.get("props")
+        if isinstance(props, dict):
+            page_props = props.get("pageProps")
+            if isinstance(page_props, dict):
+                page_data = page_props.get("data")
+                if isinstance(page_data, dict):
+                    panels = page_data.get("panels")
+                    if isinstance(panels, dict):
+                        links = panels.get("links")
+                        if isinstance(links, list):
+                            tags = _extract_tags_from_new_structure(links)
+                            if tags:
+                                return normalize_commander_tags(tags)
+
+    # Fallback to OLD structure for backward compatibility
     commander = _extract_commander_payload(payload)
     if not commander:
         return []
@@ -454,10 +548,6 @@ def extract_commander_tags_from_json(payload: Any) -> List[str]:
 def extract_commander_tags_with_counts_from_json(payload: Any) -> List[Dict[str, Any]]:
     """Return commander tags (with deck counts when available) from JSON payloads."""
 
-    commander = _extract_commander_payload(payload)
-    if not commander:
-        return []
-
     merged: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
     def record(name: str, count: Optional[int]) -> None:
@@ -472,6 +562,27 @@ def extract_commander_tags_with_counts_from_json(payload: Any) -> List[Dict[str,
                 entry["deck_count"] = count_value
             return
         merged[key] = {"tag": normalized, "deck_count": count_value}
+
+    # Try NEW structure first (current EDHREC format as of 2025)
+    if isinstance(payload, dict):
+        props = payload.get("props")
+        if isinstance(props, dict):
+            page_props = props.get("pageProps")
+            if isinstance(page_props, dict):
+                page_data = page_props.get("data")
+                if isinstance(page_data, dict):
+                    panels = page_data.get("panels")
+                    if isinstance(panels, dict):
+                        links = panels.get("links")
+                        if isinstance(links, list):
+                            _extract_tags_with_counts_from_new_structure(links, record)
+                            if merged:
+                                return list(merged.values())
+
+    # Fallback to OLD structure
+    commander = _extract_commander_payload(payload)
+    if not commander:
+        return []
 
     visited: Set[int] = set()
 
