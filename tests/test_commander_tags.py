@@ -9,6 +9,8 @@ from utils.edhrec_commander import (
     extract_commander_sections_from_json,
     extract_commander_tags_from_html,
     extract_commander_tags_from_json,
+    extract_commander_tags_with_counts_from_html,
+    extract_commander_tags_with_counts_from_json,
     normalize_commander_tags,
 )
 
@@ -17,9 +19,11 @@ HTML_SAMPLE = """
 <div class="NavigationPanel_tags__M9VjI">
   <a class="LinkHelper_container__tiM9S" href="/themes/five-color-goodstuff">
     <span class="NavigationPanel_label__xMLz1">Five-Color Goodstuff</span>
+    <span class="badge">1.2k</span>
   </a>
   <a class="LinkHelper_container__tiM9S" href="/tags/ramp/naya">
     <span class="NavigationPanel_label__xMLz1">Ramp</span>
+    <span class="badge">980</span>
   </a>
   <a class="LinkHelper_container__tiM9S" href="https://edhrec.com/tags/legendary-matters">
     <span class="NavigationPanel_label__xMLz1">Legendary Matters</span>
@@ -31,7 +35,7 @@ HTML_SAMPLE = """
 <section>
   <h2>Tags</h2>
   <div class="commander-tags">
-    <a class="chip" href="/themes/five-color-goodstuff">Should be ignored</a>
+    <a class="chip" href="/themes/five-color-goodstuff">Five-Color Goodstuff</a>
   </div>
 </section>
 <section>
@@ -173,6 +177,7 @@ JSON_SAMPLE_WITH_NESTED_TAGS = {
                                     },
                                     {
                                         "theme": {"title": "Mutate"},
+                                        "deckCount": 430,
                                     },
                                 ]
                             }
@@ -188,6 +193,15 @@ JSON_SAMPLE_WITH_NESTED_TAGS = {
 def test_extract_commander_tags_from_html():
     tags = extract_commander_tags_from_html(HTML_SAMPLE)
     assert tags == ["Five-Color Goodstuff", "Ramp", "Legendary Matters"]
+
+
+def test_extract_commander_tags_with_counts_from_html():
+    entries = extract_commander_tags_with_counts_from_html(HTML_SAMPLE)
+    assert entries == [
+        {"tag": "Five-Color Goodstuff", "deck_count": 1200},
+        {"tag": "Ramp", "deck_count": 980},
+        {"tag": "Legendary Matters", "deck_count": None},
+    ]
 
 
 def test_extract_commander_tags_from_json():
@@ -208,6 +222,15 @@ def test_extract_commander_tags_from_json_filters_structural_names():
 def test_extract_commander_tags_from_json_handles_nested_tag_field():
     tags = extract_commander_tags_from_json(JSON_SAMPLE_WITH_NESTED_TAGS)
     assert tags == ["Energy", "Counters", "+1/+1 Counters", "Mutate"]
+
+
+def test_extract_commander_tags_with_counts_from_json():
+    entries = extract_commander_tags_with_counts_from_json(JSON_SAMPLE_WITH_NESTED_TAGS)
+    counts = {entry["tag"]: entry["deck_count"] for entry in entries}
+    assert counts["+1/+1 Counters"] == 1200
+    assert counts["Mutate"] == 430
+    assert "Legendary Matters" not in counts
+    assert "Cascade Value" not in counts
 
 
 def test_extract_commander_sections_from_json():
