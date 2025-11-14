@@ -1,6 +1,6 @@
 {
   "name": "edhrec_average_deck",
-  "description": "Fetch EDHREC Average Deck for a commander (all/exhibition[/budget|/expensive]/core/upgraded/optimized/cedh[/budget|/expensive]).",
+  "description": "Fetch EDHREC Average Deck for a commander. Supports all brackets (all, exhibition/Bracket 1, core/Bracket 2, upgraded/Bracket 3, optimized/Bracket 4, cedh/Bracket 5) and budget variants (/budget or /expensive for each bracket).",
   "parameters": {
     "type": "object",
     "properties": {
@@ -10,15 +10,23 @@
       },
       "bracket": {
         "type": "string",
-        "description": "Bracket (name or 1..5)",
+        "description": "Bracket level with optional budget variant. Can use bracket names (all, exhibition, core, upgraded, optimized, cedh), numbers (1-5 for Brackets 1-5), or include /budget or /expensive suffix.",
         "enum": [
           "all",
+          "budget",
+          "expensive",
           "exhibition",
           "exhibition/budget",
           "exhibition/expensive",
           "core",
+          "core/budget",
+          "core/expensive",
           "upgraded",
+          "upgraded/budget",
+          "upgraded/expensive",
           "optimized",
+          "optimized/budget",
+          "optimized/expensive",
           "cedh",
           "cedh/budget",
           "cedh/expensive",
